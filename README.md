@@ -43,7 +43,11 @@
 ```text
 WzryNC_Auto/
 ├── wzry_auto.py                 # 主程序
-├── start.bat                    # Windows 一键启动
+├── wzry_gui.py                  # 图形助手（窗口 + 系统托盘）
+├── stats.html                   # 统计面板页面（可直接双击打开）
+├── start.bat                    # Windows 一键启动（终端模式）
+├── start_gui.bat                # Windows 图形助手启动（首次运行/装依赖）
+├── 启动农场助手.vbs             # 图形助手静默启动（日常使用，无任何窗口闪现）
 ├── start.sh                     # Linux 一键启动
 ├── monitor.sh                   # Linux 状态检查
 ├── realtime_monitor.sh          # Linux 实时日志
@@ -56,7 +60,8 @@ WzryNC_Auto/
 │       └── 2400x1080/*.png      # 2400×1080 专用模板
 ├── scripts/
 │   ├── check_requirements.py    # 依赖版本检查
-│   └── run_with_log.py          # 跨平台终端与文件双路日志
+│   ├── run_with_log.py          # 跨平台终端与文件双路日志
+│   └── stats_server.py          # 本地统计面板（HTTP）
 └── tests/
     └── test_core.py             # 离线核心测试
 ```
@@ -64,6 +69,9 @@ WzryNC_Auto/
 运行过程中会自动生成：
 
 - `assets/current.png`：最近一次设备截图
+- `assets/stats.json`：统计数据（统计面板数据源）
+- `assets/stats_data.js`：面板离线快照数据
+- `assets/gui_config.json`：图形助手的选项记忆
 - `diagnostics/`：关键步骤失败现场
 - `/tmp/wzry_run.log`：Linux 默认日志
 - `%TEMP%\wzry_run.log`：Windows 默认日志
@@ -86,7 +94,29 @@ numpy
 rapidocr-onnxruntime
 ```
 
-## Windows 一键启动
+## Windows 图形助手（推荐）
+
+不想在任务栏挂一个终端窗口时，使用图形助手：
+
+1. 首次运行双击 `start_gui.bat`（自动创建 venv 并安装依赖，之后拉起界面）。
+2. 日常使用双击 `启动农场助手.vbs`，全程无控制台窗口。
+
+界面提供：
+
+- 启动 / 停止挂机按钮，实时滚动日志（同时写入日志文件）
+- 亮度模式下拉选择（代替终端的 Y/R/1/N 交互）
+- 累计统计与下一轮启动倒计时
+- 深色 / 浅色模式切换（首次启动跟随系统设置，含标题栏）
+- 选项记忆：打开助手后自动开始、启动直接进托盘、脚本异常退出自动重启、深色模式
+
+点击窗口关闭按钮或"缩到托盘"后，助手隐藏到系统托盘（不占任务栏）；
+双击托盘图标恢复窗口，托盘右键菜单可直接启动/停止挂机或退出。
+托盘图标绿色表示挂机运行中，灰色表示未运行。
+
+停止挂机时助手会通知脚本优雅退出：先退出游戏、恢复手机亮度，再结束进程；
+即使助手进程被强制结束，挂机脚本也会因管道断开而自行退出，不会残留后台进程。
+
+## Windows 一键启动（终端模式）
 
 1. 安装 Python，并勾选 `Add Python to PATH`。
 2. 安装 Android platform-tools，并将 ADB 加入 PATH。
@@ -167,11 +197,15 @@ WZRY_DEVICE=192.168.1.100:5555 ./start.sh
 | `WZRY_VENV_DIR` | 自定义虚拟环境目录 |
 | `WZRY_LOG_FILE` | 自定义日志路径 |
 | `WZRY_UNLOCK_PWD` | 锁屏密码；无密码时留空 |
+| `WZRY_STATS_PORT` | 统计面板端口，默认 8765 |
+| `WZRY_LOCK_PORT` | 单实例锁端口；默认按设备号自动分配 |
+| `WZRY_BRIGHTNESS` | 亮度选项（Y/R/1/N），设置后跳过启动时的交互询问 |
+| `WZRY_GUI_LOCK_PORT` | 图形助手单实例锁端口，默认 47251 |
 | `PYTHON_BIN` | Linux 创建虚拟环境所用的 Python |
 
 ## 亮度模式
 
-启动时可以选择：
+终端模式启动时交互选择，图形助手在下拉框中选择（也可用 `WZRY_BRIGHTNESS` 预设）：
 
 ```text
 Y - 普通模式，关闭自动亮度并设置为 1
@@ -181,6 +215,19 @@ N - 不修改亮度
 ```
 
 正常退出、异常和 Ctrl+C 中断都会尝试退出游戏并恢复原始亮度。
+
+等待时间超过 3 分钟时会自动熄灭手机屏幕，下一轮开始时自动唤醒并解锁（有锁屏密码需设置 `WZRY_UNLOCK_PWD`）。
+
+脚本内置按设备区分的单实例锁：同一台设备重复启动会直接退出，多设备并行需为每个实例指定不同的 `WZRY_DEVICE`。
+
+## 统计面板
+
+两种打开方式，页面相同（右上角标注当前模式）：
+
+- **实时模式**：脚本运行时自动启动本机服务，浏览器访问 `http://localhost:8765`，每 10 秒自动刷新；
+- **离线模式**：直接双击项目根目录的 `stats.html`，无需任何服务在运行，展示最近一次保存的快照。
+
+面板展示累计统计（轮数、收获、经验、作物）、每一轮的完成状态与收获明细、下一轮启动时间（浇水或成熟）及实时倒计时。数据持久化在 `assets/stats.json`（离线快照为 `assets/stats_data.js`），脚本重启自动恢复历史并继续累计；Ctrl+C 退出时终端同样会打印汇总。端口可用 `WZRY_STATS_PORT` 修改，面板启动失败不影响挂机。
 
 ## 模板匹配
 
