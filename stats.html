@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>王者农场挂机面板</title>
+<style>
+  :root {
+    --bg: #0e1116; --card: #161b22; --border: #232a33;
+    --text: #e6e8eb; --muted: #8a93a0; --gold: #e8b34b;
+    --green: #3fb950; --red: #f85149; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text); padding: 24px 16px 48px;
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; justify-content: space-between;
+           flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  h1 { font-size: 22px; }
+  h1 .leaf { color: var(--gold); }
+  .hdr-right { display: flex; align-items: baseline; gap: 12px; }
+  #mode { font-size: 13px; }
+  #updated { color: var(--muted); font-size: 13px; }
+  .hero {
+    background: linear-gradient(135deg, #1b2230, #161b22);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 24px; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 28px; flex-wrap: wrap;
+  }
+  .hero .label { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+  #countdown { font-size: 40px; font-weight: 700; color: var(--gold);
+               font-variant-numeric: tabular-nums; letter-spacing: 1px; }
+  .hero .meta { color: var(--muted); font-size: 13px; line-height: 1.9; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+           font-size: 12px; border: 1px solid var(--border); }
+  .badge.reason { color: var(--blue); border-color: var(--blue); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+           gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border);
+          border-radius: 12px; padding: 14px 16px; }
+  .card .k { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+  .card .v { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  .chip { background: var(--card); border: 1px solid var(--border);
+          border-radius: 999px; padding: 4px 12px; font-size: 13px; }
+  .chip b { color: var(--gold); }
+  h2 { font-size: 16px; margin: 18px 0 10px; }
+  .tablebox { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 720px; }
+  th, td { text-align: left; padding: 9px 12px; white-space: nowrap; }
+  thead th { background: var(--card); color: var(--muted); font-weight: 500;
+             border-bottom: 1px solid var(--border); }
+  tbody tr { border-bottom: 1px solid var(--border); }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,0.03); }
+  .pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; }
+  .pill.ok { color: var(--green); border: 1px solid var(--green); }
+  .pill.bad { color: var(--red); border: 1px solid var(--red); }
+  .pill.run { color: var(--blue); border: 1px solid var(--blue); }
+  .pill.halt { color: var(--muted); border: 1px solid var(--muted); }
+  .muted { color: var(--muted); }
+  #empty { text-align: center; color: var(--muted); padding: 60px 0; display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="leaf">🌾</span> 王者农场挂机面板</h1>
+    <div class="hdr-right">
+      <span id="mode"></span>
+      <span id="updated">加载中…</span>
+    </div>
+  </header>
+
+  <div id="empty">还没有统计数据 —— 启动挂机脚本后这里会自动出现内容。</div>
+
+  <div id="content" style="display:none">
+    <div class="hero">
+      <div>
+        <div class="label">下一轮启动倒计时</div>
+        <div id="countdown">--:--:--</div>
+      </div>
+      <div class="meta">
+        <div>启动原因：<span class="badge reason" id="reason">—</span></div>
+        <div>唤醒时间：<span id="wake">—</span></div>
+        <div>目标时间：<span id="target">—</span></div>
+      </div>
+    </div>
+
+    <div class="cards">
+      <div class="card"><div class="k">执行轮数</div><div class="v" id="rounds">0</div></div>
+      <div class="card"><div class="k">成熟收获</div><div class="v" id="harvests">0</div></div>
+      <div class="card"><div class="k">累计经验</div><div class="v" id="exp">0</div></div>
+      <div class="card"><div class="k">脚本启动于</div><div class="v" id="start" style="font-size:16px">—</div></div>
+    </div>
+
+    <div class="chips" id="crops"></div>
+
+    <h2>每轮记录（最近 200 轮）</h2>
+    <div class="tablebox">
+      <table>
+        <thead><tr>
+          <th>轮次</th><th>开始</th><th>结束</th><th>状态</th>
+          <th>收获</th><th>下次启动</th><th>原因</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script id="statsjs" src="assets/stats_data.js"></script>
+<script>
+let wakeAt = null;
+let live = false;
+
+function fmtExp(n) {
+  if (!n) return "0";
+  return n >= 10000 ? (n / 10000).toFixed(2) + " 万" : String(n);
+}
+function parseTs(s) { return s ? new Date(s.replace(" ", "T")) : null; }
+function hms(t) { return t ? t.slice(11) : "—"; }
+function pillClass(status) {
+  if (status.startsWith("完成")) return "ok";
+  if (status.startsWith("失败")) return "bad";
+  if (status === "进行中") return "run";
+  return "halt";
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => (
+    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+}
+
+function reloadEmbedded() {
+  // file:// 离线模式：重新加载 assets/stats_data.js 以获取最新快照
+  return new Promise(resolve => {
+    const old = document.getElementById("statsjs");
+    if (!old) return resolve();
+    const fresh = document.createElement("script");
+    fresh.id = "statsjs";
+    fresh.src = old.src.split("?")[0] + "?t=" + Date.now();
+    fresh.onload = fresh.onerror = () => resolve();
+    old.replaceWith(fresh);
+  });
+}
+
+async function fetchData() {
+  try {
+    const r = await fetch("/data", {cache: "no-store"});
+    if (r.ok) { live = true; return await r.json(); }
+  } catch (e) { /* 服务未启动或 file:// 模式 */ }
+  live = false;
+  await reloadEmbedded();
+  return window.STATS || null;
+}
+
+function tick() {
+  const el = document.getElementById("countdown");
+  if (!wakeAt) { el.textContent = "--:--:--"; return; }
+  let diff = Math.floor((wakeAt - Date.now()) / 1000);
+  if (diff <= 0) {
+    el.textContent = live ? "进行中 / 即将启动" : "已过期（脚本未运行）";
+    return;
+  }
+  const h = String(Math.floor(diff / 3600)).padStart(2, "0");
+  const m = String(Math.floor(diff % 3600 / 60)).padStart(2, "0");
+  const s = String(diff % 60).padStart(2, "0");
+  el.textContent = h + ":" + m + ":" + s;
+}
+
+async function load() {
+  const data = await fetchData();
+  const modeEl = document.getElementById("mode");
+  modeEl.textContent = live ? "● 实时" : "○ 离线快照";
+  modeEl.style.color = live ? "var(--green)" : "var(--muted)";
+
+  const has = data && data.totals;
+  document.getElementById("empty").style.display = has ? "none" : "block";
+  document.getElementById("content").style.display = has ? "block" : "none";
+  if (!has) { document.getElementById("updated").textContent = ""; return; }
+
+  document.getElementById("updated").textContent = "数据更新于 " + (data.updated || "—");
+  document.getElementById("rounds").textContent = data.totals.rounds;
+  document.getElementById("harvests").textContent = data.totals.harvests;
+  document.getElementById("exp").textContent = fmtExp(data.totals.exp);
+  document.getElementById("start").textContent = data.start_time || "—";
+
+  const nw = data.next_wake;
+  wakeAt = nw ? parseTs(nw.wake) : null;
+  document.getElementById("reason").textContent = nw && nw.reason ? nw.reason : "—";
+  document.getElementById("wake").textContent = nw ? nw.wake : "—";
+  document.getElementById("target").textContent = nw && nw.target ? nw.target : "—";
+  tick();
+
+  const crops = data.totals.crops || {};
+  document.getElementById("crops").innerHTML = Object.keys(crops).length
+    ? Object.entries(crops).map(([k, v]) =>
+        '<span class="chip">' + esc(k) + " <b>×" + v + "</b></span>").join("")
+    : '<span class="chip muted">暂无作物收获</span>';
+
+  const rows = (data.rounds_log || []).slice().reverse().map(r => {
+    const harvest = r.exp || Object.keys(r.crops || {}).length
+      ? [r.exp ? "经验+" + fmtExp(r.exp) : "",
+         ...Object.entries(r.crops || {}).map(([k, v]) => esc(k) + "×" + v)]
+          .filter(Boolean).join("　")
+      : '<span class="muted">—</span>';
+    return "<tr>" +
+      "<td>#" + r.round + "</td>" +
+      "<td>" + hms(r.start) + "</td>" +
+      "<td>" + hms(r.end) + "</td>" +
+      '<td><span class="pill ' + pillClass(r.status) + '">' + esc(r.status) + "</span></td>" +
+      "<td>" + harvest + "</td>" +
+      "<td>" + (r.next_wake ? hms(r.next_wake) : '<span class="muted">—</span>') + "</td>" +
+      "<td>" + (r.reason ? esc(r.reason) : '<span class="muted">—</span>') + "</td>" +
+      "</tr>";
+  });
+  document.getElementById("rows").innerHTML =
+    rows.join("") || '<tr><td colspan="7" class="muted">暂无记录</td></tr>';
+}
+
+load();
+setInterval(load, 10000);
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

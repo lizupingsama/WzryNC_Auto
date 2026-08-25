@@ -12,6 +12,7 @@ import time
 import math
 import os
 import signal
+import socket
 import sys
 import shutil
 from pathlib import Path
@@ -30,6 +31,10 @@ SCRIPT_DIR = Path(__file__).parent
 ASSETS_DIR = SCRIPT_DIR / "assets"
 TEMPLATE_DIR = ASSETS_DIR / "templates"
 SCREENSHOT_PATH = str(ASSETS_DIR / "current.png")
+STATS_FILE = str(ASSETS_DIR / "stats.json")
+
+# 等待超过该秒数时熄灭手机屏幕（下一轮开头会自动唤醒解锁）
+SCREEN_OFF_WAIT_SECONDS = 180
 
 GAME_PKG = "com.tencent.tmgp.sgame"
 GAME_ACT = f"{GAME_PKG}/com.tencent.tmgp.sgame.SGameActivity"
@@ -92,6 +97,49 @@ class Stats:
         self.total_exp = 0       # 累计获得经验
         self.total_crops = {}    # 累计收获作物 {作物名: 数量}
         self.start_time = datetime.now()
+        self.rounds_log = []     # 每轮记录（最多保留最近200轮）
+        self.next_wake = None    # 下一轮启动信息 {"wake", "target", "reason"}
+        self.current = None      # 当前轮记录
+
+    @staticmethod
+    def _now():
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def load(self):
+        """从磁盘恢复历史统计，实现跨会话累计"""
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        totals = data.get("totals", {})
+        self.rounds = totals.get("rounds", 0)
+        self.harvests = totals.get("harvests", 0)
+        self.total_exp = totals.get("exp", 0)
+        self.total_crops = totals.get("crops", {}) or {}
+        self.rounds_log = data.get("rounds_log", []) or []
+        self.next_wake = data.get("next_wake")
+        # 上次会话残留的"进行中"轮次标记为中断
+        for record in self.rounds_log:
+            if record.get("status") == "进行中":
+                record["status"] = "中断退出"
+
+    def begin_round(self, round_num):
+        """开始新一轮，写入进行中记录"""
+        self.rounds = round_num
+        self.current = {
+            "round": round_num,
+            "start": self._now(),
+            "end": None,
+            "status": "进行中",
+            "exp": 0,
+            "crops": {},
+            "next_wake": None,
+            "reason": None,
+        }
+        self.rounds_log.append(self.current)
+        del self.rounds_log[:-200]
+        self.save()
 
     def add_harvest(self, exp=0, crops=None):
         """记录一次收获"""
@@ -101,6 +149,60 @@ class Stats:
         if crops:
             for name, count in crops.items():
                 self.total_crops[name] = self.total_crops.get(name, 0) + count
+        if self.current is not None:
+            self.current["exp"] += exp
+            for name, count in (crops or {}).items():
+                self.current["crops"][name] = self.current["crops"].get(name, 0) + count
+        self.save()
+
+    def set_next_wake(self, wake_time, target_time=None, reason=""):
+        """记录下一轮启动时间（浇水/成熟/重试）"""
+        info = {
+            "wake": wake_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "target": target_time.strftime("%Y-%m-%d %H:%M:%S") if target_time else None,
+            "reason": reason,
+        }
+        self.next_wake = info
+        if self.current is not None:
+            self.current["next_wake"] = info["wake"]
+            self.current["reason"] = reason
+        self.save()
+
+    def finish_round(self, status="完成"):
+        """结束当前轮；只覆盖仍为进行中的状态，避免重复标记"""
+        if self.current is not None and self.current["status"] == "进行中":
+            self.current["status"] = status
+            self.current["end"] = self._now()
+        self.save()
+
+    def save(self):
+        """原子写入 stats.json，供统计面板读取"""
+        data = {
+            "updated": self._now(),
+            "start_time": self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "totals": {
+                "rounds": self.rounds,
+                "harvests": self.harvests,
+                "exp": self.total_exp,
+                "crops": self.total_crops,
+            },
+            "next_wake": self.next_wake,
+            "rounds_log": self.rounds_log,
+        }
+        try:
+            tmp = STATS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, STATS_FILE)
+            # 同步生成离线快照数据，供直接双击 stats.html 查看
+            js_path = os.path.join(os.path.dirname(STATS_FILE), "stats_data.js")
+            with open(js_path + ".tmp", "w", encoding="utf-8") as f:
+                f.write("window.STATS = ")
+                json.dump(data, f, ensure_ascii=False)
+                f.write(";")
+            os.replace(js_path + ".tmp", js_path)
+        except OSError as exc:
+            print(f"  ⚠️ 统计写入失败: {exc}")
     
     def summary(self):
         elapsed = datetime.now() - self.start_time
@@ -124,11 +226,15 @@ stats = Stats()
 
 def signal_handler(sig, frame):
     print("\n\n⚠️ 收到终止信号，正在退出...")
+    stats.finish_round("中断退出")
     stats.summary()
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+if hasattr(signal, "SIGBREAK"):
+    # Windows 下收到 CTRL_BREAK / 控制台关闭时也走统一清理流程
+    signal.signal(signal.SIGBREAK, signal_handler)
 
 # ============================================================
 # 浇水时间计算
@@ -189,7 +295,8 @@ def calculate_plant_cycle_and_water_time(first_water_time, show_mature_time, sav
     # 优先使用存储的作物周期
     stored_crop, stored_cycle = load_crop_cycle()
     
-    if stored_cycle is not None and not save_if_fresh:
+    # 剩余时间超过存储周期说明换过作物或记录过期，忽略存储值重新匹配
+    if stored_cycle is not None and not save_if_fresh and remain_min <= stored_cycle * 1.1:
         cycle_min = stored_cycle
         print(f"  ✅ 使用存储的作物周期：{stored_crop} = {cycle_min}分钟")
     else:
@@ -437,8 +544,38 @@ def restore_brightness():
     _original_auto_brightness = None
     _brightness_mode = None
 
+_INVALID_CHOICE = object()
+
+def apply_brightness_choice(choice):
+    """应用亮度选项；无法识别时返回 _INVALID_CHOICE。"""
+    if choice in ('Y', 'YES', 'LOW'):
+        get_brightness_settings()
+        set_brightness_low()
+        return 'low'
+    if choice in ('R', 'ROOT', 'ROOT_ZERO'):
+        get_brightness_settings()
+        set_brightness_zero_root()
+        return 'root_zero'
+    if choice in ('1', 'ROOT_ONE'):
+        get_brightness_settings()
+        set_brightness_one_root()
+        return 'root_one'
+    if choice in ('N', 'NO', 'NONE', 'KEEP'):
+        print("  ℹ️ 保持当前亮度设置")
+        return None
+    return _INVALID_CHOICE
+
 def prompt_brightness_control():
-    """询问用户是否降低亮度"""
+    """选择亮度模式；GUI/无人值守场景用 WZRY_BRIGHTNESS 跳过交互。"""
+    env_choice = os.environ.get("WZRY_BRIGHTNESS", "").strip().upper()
+    if env_choice:
+        mode = apply_brightness_choice(env_choice)
+        if mode is not _INVALID_CHOICE:
+            print(f"  💡 按 WZRY_BRIGHTNESS={env_choice} 设置亮度（跳过交互）")
+            return mode
+        print(f"  ⚠️ 无法识别 WZRY_BRIGHTNESS={env_choice}，保持当前亮度")
+        return None
+
     print("\n" + "=" * 60)
     print("💡 是否降低屏幕亮度以减少烧屏风险？")
     print("=" * 60)
@@ -447,26 +584,13 @@ def prompt_brightness_control():
     print("  1 - ROOT权限，亮度设为1（极低亮度）")
     print("  N - 保持当前亮度设置")
     print("=" * 60)
-    
+
     while True:
         choice = input("请选择 (Y/R/1/N): ").strip().upper()
-        if choice in ['Y', 'YES']:
-            get_brightness_settings()
-            set_brightness_low()
-            return 'low'
-        elif choice in ['R', 'ROOT']:
-            get_brightness_settings()
-            set_brightness_zero_root()
-            return 'root_zero'
-        elif choice == '1':
-            get_brightness_settings()
-            set_brightness_one_root()
-            return 'root_one'
-        elif choice in ['N', 'NO']:
-            print("  ℹ️ 保持当前亮度设置")
-            return None
-        else:
-            print("  ⚠️ 请输入 Y、R、1 或 N")
+        mode = apply_brightness_choice(choice)
+        if mode is not _INVALID_CHOICE:
+            return mode
+        print("  ⚠️ 请输入 Y、R、1 或 N")
 
 def cv_imread(path):
     """读取图片；cv2.imread 在 Windows 上无法处理含中文的路径，改用 imdecode。"""
@@ -709,9 +833,22 @@ def get_ocr():
         _ocr_engine = RapidOCR()
     return _ocr_engine
 
+def parse_relative_maturity(text):
+    """解析"X小时Y分钟后成熟"类相对时间，返回剩余分钟数；不匹配返回 None。"""
+    import re
+    match = re.search(r'(?:(\d+)\s*小时)?\s*(?:(\d+)\s*分钟?)?\s*后成熟', text)
+    if match and (match.group(1) or match.group(2)):
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        return hours * 60 + minutes
+    if re.search(r'\d+\s*秒后成熟', text):
+        return 1  # 秒级剩余按1分钟处理
+    return None
+
 def read_maturity_time(screenshot_path):
-    """从截图中读取成熟时间（绝对时间，如16:46=16点46分）
-    返回: ((hour, minute), is_mature) 
+    """从截图中读取成熟时间
+    支持绝对时间（"18:25成熟"）与相对时间（"17分钟后成熟"）两种界面格式。
+    返回: ((hour, minute), is_mature)
         - 识别到时间: ((hour, minute), False)
         - 作物已成熟可收获: (None, True)
         - 无法识别: (None, False)
@@ -736,7 +873,16 @@ def read_maturity_time(screenshot_path):
         # 检查是否显示"可收获"或"已成熟"（作物已经成熟）
         if "可收获" in all_text or "已成熟" in all_text:
             return None, True
-        
+
+        # 相对时间格式（如"17分钟后成熟"、"1小时30分钟后成熟"）
+        rel_min = parse_relative_maturity(all_text)
+        if rel_min is not None:
+            if rel_min <= 0:
+                return None, True
+            target = datetime.now() + timedelta(minutes=rel_min)
+            print(f"  🕐 OCR识别: {rel_min}分钟后成熟 → {target.strftime('%H:%M')}")
+            return (target.hour, target.minute), False
+
         # 匹配成熟时间（如 "18:25成熟"、"明天00：02成熟"，兼容全角冒号）
         for line in result:
             text = line[1]
@@ -749,12 +895,31 @@ def read_maturity_time(screenshot_path):
 
     return None, False
 
+def parse_harvest_exp(all_text):
+    """从OCR文本解析经验值；支持整数与 "27.50万" 这类小数+万单位格式。"""
+    import re
+    patterns = (
+        r'XP\s*(\d+(?:\.\d+)?)(万?)',
+        r'(\d+(?:\.\d+)?)(万?)\s*XP',
+        r'(\d+(?:\.\d+)?)(万?)\s*农场[经経]验',
+        r'[+＋](\d+(?:\.\d+)?)(万?)\s*[经経]验',
+        r'[经経]验\s*[+＋](\d+(?:\.\d+)?)(万?)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, all_text)
+        if match:
+            value = float(match.group(1))
+            if match.group(2):
+                value *= 10000
+            return int(value)
+    return 0
+
 def read_harvest_info(screenshot_path):
     """从收获弹窗截图中OCR识别收获信息
     返回: {"exp": int, "crops": {作物名: 数量}} 或 None
     """
     import re
-    
+
     img = cv_imread(screenshot_path)
     if img is None:
         return None
@@ -779,21 +944,12 @@ def read_harvest_info(screenshot_path):
     harvest = {"exp": 0, "crops": {}}
     
     # 识别经验
-    # 匹配: "XP" + 数字, "农场经验" + 数字, "+数字经验", "经验+数字"
-    exp_match = re.search(r'XP\s*(\d+)', all_text)
-    if not exp_match:
-        exp_match = re.search(r'(\d+)\s*XP', all_text)
-    if not exp_match:
-        exp_match = re.search(r'[+＋](\d+)\s*[经経]验', all_text)
-    if not exp_match:
-        exp_match = re.search(r'[经経]验\s*[+＋](\d+)', all_text)
-    if exp_match:
-        harvest["exp"] = int(exp_match.group(1))
+    harvest["exp"] = parse_harvest_exp(all_text)
     
     # 识别作物名和数量
     # OCR输出格式: 作物名和数字可能在不同行，按x坐标排序配对
-    crop_names = {"番茄", "洋葱", "小麦", "土豆", "胡萝卜", "白菜", "玉米",
-                  "南瓜", "草莓", "西瓜", "辣椒", "茄子", "黄瓜", "大豆"}
+    # 作物名按"1-4个汉字且非界面固定词"识别，避免每出新作物就要维护清单
+    exclude_words = {"农场经验", "点击继续", "恭喜您获得", "已成熟", "可收获"}
     
     # 提取所有文字及其位置
     items = []
@@ -809,7 +965,7 @@ def read_harvest_info(screenshot_path):
     
     for item in items:
         text = item["text"].strip()
-        if text in crop_names:
+        if re.fullmatch(r'[一-鿿]{1,4}', text) and text not in exclude_words:
             crops_found.append({"x": item["x"], "y": item["y"], "name": text})
         elif text.isdigit() and int(text) > 0:
             numbers.append({
@@ -1146,7 +1302,7 @@ def step9_move_to_farmland(first_water_time, save_if_fresh=False):
     # 如果作物已成熟（可收获），不需要等待
     if is_mature:
         print("  🌾 作物已成熟，无需等待")
-        return None, None, None
+        return None, None, None, True
     
     # 计算浇水计划
     result = None
@@ -1161,27 +1317,29 @@ def step9_move_to_farmland(first_water_time, save_if_fresh=False):
         
         # 调用新的浇水计算函数
         result = calculate_plant_cycle_and_water_time(first_water_time, maturity_dt, save_if_fresh=save_if_fresh)
-    
-    return maturity_time, result, maturity_dt
+
+    return maturity_time, result, maturity_dt, False
 
 # ============================================================
 # 步骤10: 计算等待时间
 # ============================================================
-def step10_calculate_wait(maturity_time, result, maturity_dt):
+def step10_calculate_wait(maturity_time, result, maturity_dt, is_mature=False):
     """步骤10: 根据成熟时间和浇水时间计算等待时间
-    
+
     :param maturity_time: OCR识别的 (hour, minute) 元组
     :param result: 浇水计算结果 dict
     :param maturity_dt: 成熟时间 (datetime)
+    :param is_mature: 作物已成熟可收获（与"识别失败"明确区分）
     :return: wake_time (下次唤醒时间)
     """
     print("\n[步骤10] 计算等待时间...")
-    
-    # 如果所有参数都为None，说明作物已成熟可收获，直接重启收割
-    if maturity_time is None and result is None and maturity_dt is None:
+
+    # 作物已成熟可收获，直接重启收割；识别失败则走下方5分钟重试分支
+    if is_mature:
         print("  🌾 作物已成熟，退出游戏重新进入收割...")
         adb_shell(f"am force-stop {GAME_PKG}")
         _reapply_low_brightness()
+        stats.set_next_wake(datetime.now(), None, "作物已成熟，立即收割")
         time.sleep(3)
         return None
     
@@ -1214,13 +1372,16 @@ def step10_calculate_wait(maturity_time, result, maturity_dt):
         print(f"  🌾 成熟时间: {maturity_dt.strftime('%H:%M:%S')}")
     else:
         print("  ⚠️ 无法识别时间，5分钟后重试...")
-        return now + timedelta(minutes=5)
+        retry_time = now + timedelta(minutes=5)
+        stats.set_next_wake(retry_time, None, "识别失败重试")
+        return retry_time
     
     # 提前2分钟唤醒
     wake_time -= timedelta(minutes=2)
     
     if wake_time <= now:
         print(f"  ⚠️ {reason}时间已到，立即重新启动")
+        stats.set_next_wake(now, wake_time + timedelta(minutes=2), reason)
         return now
     
     wait_seconds = int((wake_time - now).total_seconds())
@@ -1231,7 +1392,7 @@ def step10_calculate_wait(maturity_time, result, maturity_dt):
     print(f"  🎯 目标时间: {(wake_time + timedelta(minutes=2)).strftime('%H:%M:%S')} ({reason})")
     print(f"  🔔 提前2分钟唤醒: {wake_time.strftime('%H:%M:%S')}")
     print(f"  ⏳ 等待 {hours}小时{minutes}分{seconds:02d}秒")
-    
+    stats.set_next_wake(wake_time, wake_time + timedelta(minutes=2), reason)
     return wake_time
 # ============================================================
 # 主流程
@@ -1295,6 +1456,42 @@ def resolve_device():
     print("  ❌ 未发现在线设备，请先连接 ADB 或设置 WZRY_DEFAULT_DEVICE")
     return False
 
+_instance_lock = None
+
+def acquire_instance_lock():
+    """端口绑定式单实例锁：原子、进程退出自动释放、按设备区分。
+
+    同一设备只允许一个脚本实例；多设备并行时各实例的 WZRY_DEVICE
+    不同，锁端口互不冲突。可用 WZRY_LOCK_PORT 显式指定。
+    """
+    global _instance_lock
+    import zlib
+    port = int(os.environ.get("WZRY_LOCK_PORT", "0"))
+    if not port:
+        port = 46000 + zlib.crc32((DEVICE or "default").encode("utf-8")) % 1000
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+        sock.listen(1)
+    except OSError:
+        sock.close()
+        print(f"  ❌ 本设备已有脚本实例在运行（锁端口 {port} 被占用），本实例退出")
+        print("     如需多设备并行，请为每个实例设置不同的 WZRY_DEVICE")
+        return False
+    _instance_lock = sock
+    return True
+
+def start_stats_server():
+    """后台线程启动本地统计面板；失败不影响挂机。"""
+    try:
+        sys.path.insert(0, str(SCRIPT_DIR / "scripts"))
+        import stats_server
+        port = int(os.environ.get("WZRY_STATS_PORT", "8765"))
+        stats_server.start_in_background(STATS_FILE, port)
+        print(f"  📊 统计面板: http://localhost:{port}")
+    except Exception as exc:
+        print(f"  ⚠️ 统计面板启动失败（不影响挂机）: {exc}")
+
 def main():
     """主流程"""
     global JOYSTICK_CENTER, _step6_cfg
@@ -1304,9 +1501,18 @@ def main():
     # 显示支持的分辨率及参数
     for (w, h), cfg in STEP6_CONFIG.items():
         print(f"  📐 {w}x{h}: 中心{cfg['center']} {cfg['angle']}° {cfg['distance']}px {cfg['duration']}ms")
-    
+
+    # 本地统计面板（先恢复历史统计，实现跨会话累计）
+    stats.load()
+    stats.save()
+    start_stats_server()
+
     # 启动前选择并检查ADB连接
     if not resolve_device() or not check_adb_connection():
+        return
+
+    # 单实例锁：防止两个脚本同时操作同一台设备
+    if not acquire_instance_lock():
         return
     
     # 询问是否降低亮度
@@ -1339,10 +1545,10 @@ def main():
         }
         print(f"  🎯 步骤6使用缩放配置: {_step6_cfg}")
     
-    round_num = 0
+    round_num = stats.rounds  # 接续历史轮次编号
     while True:
         round_num += 1
-        stats.rounds = round_num
+        stats.begin_round(round_num)
         print(f"\n{'='*60}")
         print(f"# 第 {round_num} 轮务农")
         print(f"{'='*60}")
@@ -1357,6 +1563,7 @@ def main():
             # 步骤2: 启动游戏
             if not step2_launch_game():
                 print("\n⚠️ 游戏启动页超时，重新开始...")
+                stats.finish_round("失败：游戏启动页超时")
                 save_diagnostic("step2_launch")
                 force_stop_game()
                 time.sleep(30)
@@ -1368,6 +1575,7 @@ def main():
             # 步骤3: 点击开始游戏
             if not step3_click_start_game():
                 print("\n⚠️ 步骤3失败，重新开始...")
+                stats.finish_round("失败：未能点击开始游戏")
                 force_stop_game()
                 continue
         
@@ -1377,6 +1585,7 @@ def main():
             # 步骤5: 进入农场
             if not step5_enter_farm():
                 print("\n⚠️ 步骤5失败，重新开始...")
+                stats.finish_round("失败：未能进入农场")
                 force_stop_game()
                 continue
         
@@ -1391,6 +1600,7 @@ def main():
                 farm_ok, first_water_time = step7_oneclick_farm()
             if not farm_ok:
                 print("\n❌ 步骤7连续失败，本轮结束")
+                stats.finish_round("失败：未找到一键务农")
                 force_stop_game()
                 time.sleep(30)
                 continue
@@ -1399,30 +1609,62 @@ def main():
             _, harvested = step8_close_harvest()
         
             # 步骤9: 移动到土地，读取成熟时间，计算浇水计划
-            maturity_time, result, maturity_dt = step9_move_to_farmland(first_water_time, save_if_fresh=harvested)
-        
+            maturity_time, result, maturity_dt, is_mature = step9_move_to_farmland(first_water_time, save_if_fresh=harvested)
+
             # 步骤10: 计算等待时间，返回唤醒时间
-            wake_time = step10_calculate_wait(maturity_time, result, maturity_dt)
+            wake_time = step10_calculate_wait(maturity_time, result, maturity_dt, is_mature)
         
             if wake_time is None:
                 # 作物已成熟，立即重新开始
+                stats.finish_round("完成：作物已成熟，立即收割")
                 continue
-        
+
+            stats.finish_round("完成")
             # 等待到唤醒时间
             now = datetime.now()
             if wake_time > now:
                 wait_seconds = int((wake_time - now).total_seconds())
+                if wait_seconds > SCREEN_OFF_WAIT_SECONDS:
+                    print("  🌙 等待较长，熄灭手机屏幕")
+                    adb_shell("input keyevent KEYCODE_SLEEP")
                 print(f"\n⏳ 等待到 {wake_time.strftime('%H:%M:%S')} 唤醒...")
                 time.sleep(wait_seconds)
             # 醒屏和解锁在下一轮循环开头统一处理
         except subprocess.TimeoutExpired as exc:
             # 设备偶发无响应（USB抖动、高负载卡顿）不应终止挂机，放弃本轮稍后重试。
             print(f"\n⚠️ ADB 命令超时，放弃本轮，30秒后重试: {exc}")
+            stats.finish_round("失败：ADB命令超时")
             force_stop_game()
             time.sleep(30)
 
+def _start_gui_stop_watcher():
+    """GUI 模式（WZRY_GUI=1）：监听 stdin，收到 stop 或管道断开时优雅退出。
+
+    图形助手（wzry_gui.py）以管道接管本进程 stdin。即使助手被强制结束，
+    管道 EOF 也会触发这里的退出流程，避免留下无人管理的挂机进程。
+    raise_signal(SIGINT) 经 C 层处理器唤醒主线程（包括长 time.sleep），
+    走既有的 signal_handler → 清理 → 恢复亮度路径；
+    Windows + Python 3.10 下 _thread.interrupt_main 无法唤醒 sleep，不要换回。
+    """
+    if os.environ.get("WZRY_GUI") != "1":
+        return
+    import threading
+
+    def watch():
+        try:
+            for line in sys.stdin:
+                if line.strip().lower() == "stop":
+                    break
+        except (OSError, ValueError):
+            pass
+        print("\n⚠️ 收到助手停止指令（或助手已关闭），正在退出...")
+        signal.raise_signal(signal.SIGINT)
+
+    threading.Thread(target=watch, daemon=True, name="gui-stop-watcher").start()
+
 def run_main():
     """运行主流程，确保退出时恢复亮度"""
+    _start_gui_stop_watcher()
     try:
         main()
     except KeyboardInterrupt:

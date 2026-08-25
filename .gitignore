@@ -5,6 +5,12 @@ __pycache__/
 .venv/
 venv/
 
+# 运行时数据
+assets/stats.json
+assets/stats_data.js
+assets/gui_config.json
+assets/gui_error.log
+
 # 截图临时文件
 assets/current.png
 assets/after_oneclick.png
