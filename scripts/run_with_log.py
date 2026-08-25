@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """跨平台运行主脚本，同时将输出写到终端和日志文件。"""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,8 @@ def main():
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        # 子进程 stdout 是管道，中文 Windows 默认按 GBK 编码，与此处的 UTF-8 解码不一致。
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
 
     try:

@@ -17,6 +17,12 @@ import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 
+# Windows 中文系统下 stdout 走管道/重定向时默认 GBK，无法编码 emoji 输出。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ============================================================
 # 配置
 # ============================================================
@@ -234,12 +240,12 @@ def calculate_plant_cycle_and_water_time(first_water_time, show_mature_time, sav
 # ============================================================
 # ADB 基础操作
 # ============================================================
-def adb_shell(cmd):
+def adb_shell(cmd, timeout=10):
     """执行设备端 shell 命令，不经过主机 shell。"""
     result = subprocess.run(
         [ADB, "-s", DEVICE, "shell", cmd],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=10,
+        timeout=timeout,
     )
     return result.stdout
 
@@ -462,17 +468,39 @@ def prompt_brightness_control():
         else:
             print("  ⚠️ 请输入 Y、R、1 或 N")
 
+def cv_imread(path):
+    """读取图片；cv2.imread 在 Windows 上无法处理含中文的路径，改用 imdecode。"""
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+def cv_imwrite(path, img):
+    """写入图片；与 cv_imread 同理，改用 imencode 规避中文路径问题。"""
+    ok, buf = cv2.imencode(Path(path).suffix or ".png", img)
+    if ok:
+        buf.tofile(str(path))
+    return bool(ok)
+
 def screenshot(path=SCREENSHOT_PATH):
-    """截图"""
-    adb_shell("screencap -p /sdcard/screen.png")
-    adb_command("pull", "/sdcard/screen.png", path)
+    """截图；高分辨率设备压缩 PNG 较慢，放宽超时，失败时清除旧图避免误用陈旧画面。"""
+    try:
+        adb_shell("screencap -p /sdcard/screen.png", timeout=30)
+        adb_command("pull", "/sdcard/screen.png", path, timeout=30)
+    except subprocess.TimeoutExpired:
+        print("  ⚠️ 截图超时，跳过本次画面")
+        Path(path).unlink(missing_ok=True)
+        return path
     # 自动旋转：竖屏截图 → 横屏
-    img = cv2.imread(path)
+    img = cv_imread(path)
     if img is not None:
         h, w = img.shape[:2]
         if h > w:
             img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            cv2.imwrite(path, img)
+            cv_imwrite(path, img)
     return path
 
 def detect_resolution():
@@ -515,7 +543,7 @@ def _template_scales(tdir, img_w, img_h):
 
 def find_template(template_name, screenshot_path, threshold=None, roi=None):
     """在限定区域内多尺度查找模板（分辨率专用模板优先）。"""
-    img = cv2.imread(screenshot_path)
+    img = cv_imread(screenshot_path)
     if img is None:
         return None
     
@@ -545,7 +573,7 @@ def find_template(template_name, screenshot_path, threshold=None, roi=None):
         if not template_path.exists():
             continue
         
-        tmpl = cv2.imread(str(template_path))
+        tmpl = cv_imread(template_path)
         if tmpl is None:
             continue
         
@@ -690,7 +718,7 @@ def read_maturity_time(screenshot_path):
     """
     import re
 
-    img = cv2.imread(screenshot_path)
+    img = cv_imread(screenshot_path)
     if img is None:
         return None, False
 
@@ -727,7 +755,7 @@ def read_harvest_info(screenshot_path):
     """
     import re
     
-    img = cv2.imread(screenshot_path)
+    img = cv_imread(screenshot_path)
     if img is None:
         return None
     
@@ -1319,72 +1347,79 @@ def main():
         print(f"# 第 {round_num} 轮务农")
         print(f"{'='*60}")
         
-        # 步骤1: 检测状态
-        step1_check_status()
-        
-        # 步骤2: 启动游戏
-        if not step2_launch_game():
-            print("\n⚠️ 游戏启动页超时，重新开始...")
-            save_diagnostic("step2_launch")
-            force_stop_game()
-            time.sleep(30)
-            continue
+        try:
+            # 唤醒屏幕并解锁（首轮启动或长等待后手机可能处于息屏状态）
+            wake_and_unlock(UNLOCK_PWD)
 
-        # 步骤2b: 关闭启动弹窗
-        step2b_close_startup_popups()
+            # 步骤1: 检测状态
+            step1_check_status()
+        
+            # 步骤2: 启动游戏
+            if not step2_launch_game():
+                print("\n⚠️ 游戏启动页超时，重新开始...")
+                save_diagnostic("step2_launch")
+                force_stop_game()
+                time.sleep(30)
+                continue
 
-        # 步骤3: 点击开始游戏
-        if not step3_click_start_game():
-            print("\n⚠️ 步骤3失败，重新开始...")
-            force_stop_game()
-            continue
+            # 步骤2b: 关闭启动弹窗
+            step2b_close_startup_popups()
+
+            # 步骤3: 点击开始游戏
+            if not step3_click_start_game():
+                print("\n⚠️ 步骤3失败，重新开始...")
+                force_stop_game()
+                continue
         
-        # 步骤4: 关闭弹窗
-        step4_close_popup()
+            # 步骤4: 关闭弹窗
+            step4_close_popup()
         
-        # 步骤5: 进入农场
-        if not step5_enter_farm():
-            print("\n⚠️ 步骤5失败，重新开始...")
-            force_stop_game()
-            continue
+            # 步骤5: 进入农场
+            if not step5_enter_farm():
+                print("\n⚠️ 步骤5失败，重新开始...")
+                force_stop_game()
+                continue
         
-        # 步骤6: 移动到雕像
-        step6_move_to_statue()
-        
-        # 步骤7: 一键务农
-        farm_ok, first_water_time = step7_oneclick_farm()
-        if not farm_ok:
-            print("\n⚠️ 步骤7失败，返回步骤6...")
+            # 步骤6: 移动到雕像
             step6_move_to_statue()
+        
+            # 步骤7: 一键务农
             farm_ok, first_water_time = step7_oneclick_farm()
-        if not farm_ok:
-            print("\n❌ 步骤7连续失败，本轮结束")
+            if not farm_ok:
+                print("\n⚠️ 步骤7失败，返回步骤6...")
+                step6_move_to_statue()
+                farm_ok, first_water_time = step7_oneclick_farm()
+            if not farm_ok:
+                print("\n❌ 步骤7连续失败，本轮结束")
+                force_stop_game()
+                time.sleep(30)
+                continue
+        
+            # 步骤8: 关闭收获弹窗
+            _, harvested = step8_close_harvest()
+        
+            # 步骤9: 移动到土地，读取成熟时间，计算浇水计划
+            maturity_time, result, maturity_dt = step9_move_to_farmland(first_water_time, save_if_fresh=harvested)
+        
+            # 步骤10: 计算等待时间，返回唤醒时间
+            wake_time = step10_calculate_wait(maturity_time, result, maturity_dt)
+        
+            if wake_time is None:
+                # 作物已成熟，立即重新开始
+                continue
+        
+            # 等待到唤醒时间
+            now = datetime.now()
+            if wake_time > now:
+                wait_seconds = int((wake_time - now).total_seconds())
+                print(f"\n⏳ 等待到 {wake_time.strftime('%H:%M:%S')} 唤醒...")
+                time.sleep(wait_seconds)
+            # 醒屏和解锁在下一轮循环开头统一处理
+        except subprocess.TimeoutExpired as exc:
+            # 设备偶发无响应（USB抖动、高负载卡顿）不应终止挂机，放弃本轮稍后重试。
+            print(f"\n⚠️ ADB 命令超时，放弃本轮，30秒后重试: {exc}")
             force_stop_game()
             time.sleep(30)
-            continue
-        
-        # 步骤8: 关闭收获弹窗
-        _, harvested = step8_close_harvest()
-        
-        # 步骤9: 移动到土地，读取成熟时间，计算浇水计划
-        maturity_time, result, maturity_dt = step9_move_to_farmland(first_water_time, save_if_fresh=harvested)
-        
-        # 步骤10: 计算等待时间，返回唤醒时间
-        wake_time = step10_calculate_wait(maturity_time, result, maturity_dt)
-        
-        if wake_time is None:
-            # 作物已成熟，立即重新开始
-            continue
-        
-        # 等待到唤醒时间
-        now = datetime.now()
-        if wake_time > now:
-            wait_seconds = int((wake_time - now).total_seconds())
-            print(f"\n⏳ 等待到 {wake_time.strftime('%H:%M:%S')} 唤醒...")
-            time.sleep(wait_seconds)
-        
-        # 唤醒屏幕并解锁
-        wake_and_unlock(UNLOCK_PWD)
 
 def run_main():
     """运行主流程，确保退出时恢复亮度"""
