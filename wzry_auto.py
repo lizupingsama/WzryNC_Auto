@@ -87,6 +87,8 @@ TEMPLATE_ROIS = {
     # 模板主体会伸到 0.78 左侧，框到 0.78 会把它裁掉导致匹配不到。
     "close_popup.png": (0.70, 0.03, 0.96, 0.30),
     "close_popup_event.png": (0.70, 0.03, 0.96, 0.30),
+    # 协议弹窗只框「同意」按钮（左边界 0.48 把 0.49 屏宽处的「拒绝」排除在外）
+    "agree_terms.png": (0.48, 0.62, 0.82, 0.92),
     "lainongchang.png": (0.00, 0.55, 0.55, 1.00),
     "refresh_pos.png": (0.75, 0.70, 1.00, 1.00),
     "oneclick_farm.png": (0.45, 0.35, 0.80, 0.80),
@@ -97,6 +99,7 @@ TEMPLATE_THRESHOLDS = {
     "start_game.png": 0.75,
     "close_popup.png": 0.90,
     "close_popup_event.png": 0.78,
+    "agree_terms.png": 0.85,
     "lainongchang.png": 0.75,
     "refresh_pos.png": 0.60,
     "oneclick_farm.png": 0.75,
@@ -1117,7 +1120,8 @@ def step2_launch_game():
     adb_shell(f"am start -n {GAME_ACT}")
     print("  ⏳ 等待登录页或启动弹窗...")
     return wait_for_any_template(
-        ["start_game.png", "close_popup.png", "close_popup_event.png"],
+        ["start_game.png", "close_popup.png", "close_popup_event.png",
+         "agree_terms.png"],
         timeout=60, interval=3, label="游戏启动页",
     ) is not None
 
@@ -1133,12 +1137,14 @@ def step2b_close_startup_popups():
     for i in range(10):  # 最多处理10个弹窗
         screenshot(SCREENSHOT_PATH)
         result = find_any_template(
-            ["close_popup.png", "close_popup_event.png"], SCREENSHOT_PATH
+            ["close_popup.png", "close_popup_event.png", "agree_terms.png"],
+            SCREENSHOT_PATH,
         )
 
         if result:
             x, y = result["x"], result["y"]
-            tap(x, y, f"关闭启动弹窗/{result['template']}")
+            action = "同意协议" if result["template"] == "agree_terms.png" else "关闭启动弹窗"
+            tap(x, y, f"{action}/{result['template']}")
             miss_count = 0
             print("  ⏳ 等待5秒...")
             time.sleep(5)
@@ -1177,7 +1183,13 @@ def step3_click_start_game():
                 return True
             save_diagnostic("step3_lobby_timeout")
             return False
-        
+
+        # 协议条款更新后首启弹「拒绝/同意」确认框（无 ✕），点掉后登录页才出现
+        if click_template("agree_terms.png", SCREENSHOT_PATH, label="同意协议"):
+            print("  ⏳ 已同意协议，等待5秒...")
+            time.sleep(5)
+            continue
+
         if attempt < 4:
             print("  ⏳ 等待5秒...")
             time.sleep(5)

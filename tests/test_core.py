@@ -54,6 +54,30 @@ class TemplateMatchingTests(unittest.TestCase):
             (result["x"], result["y"]), (2458 + tw // 2, 161 + th // 2)
         )
 
+    def test_agree_terms_matches_at_real_position(self):
+        # 协议条款更新弹窗只有「拒绝/同意」两键、无 ✕；模板取自 3200x1440
+        # 实机截图，「同意」按钮中心位于 (1851,1089)
+        template = wzry_auto.cv_imread(
+            ROOT / "assets" / "templates" / "3200x1440" / "agree_terms.png"
+        )
+        th, tw = template.shape[:2]
+        canvas = np.zeros((1440, 3200, 3), dtype=np.uint8)
+        canvas[1038:1038 + th, 1630:1630 + tw] = template
+        with tempfile.TemporaryDirectory() as directory:
+            screenshot = Path(directory) / "agree.png"
+            wzry_auto.cv_imwrite(screenshot, canvas)
+            result = wzry_auto.find_template("agree_terms.png", str(screenshot))
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            (result["x"], result["y"]), (1630 + tw // 2, 1038 + th // 2)
+        )
+
+    def test_agree_roi_excludes_refuse_button(self):
+        # 「拒绝」按钮占 0.35~0.49 屏宽，搜索区左界必须足够靠右，
+        # 保证「拒绝」永远无法被完整框进搜索区而误点
+        x1, _, _, _ = wzry_auto.TEMPLATE_ROIS["agree_terms.png"]
+        self.assertGreaterEqual(x1, 0.45)
+
     def test_dedicated_template_scales_are_bounded(self):
         # 精确匹配的分辨率目录：预测比例为 1，尺度限制在 ±10%
         scales = wzry_auto._template_scales(2400, 1080, (2400, 1080))
