@@ -83,8 +83,10 @@ _step6_cfg = {"center": (160, 486), "angle": 120, "distance": 200, "duration": 1
 # 模板搜索区域使用归一化坐标 (x1, y1, x2, y2)，减少动态背景误匹配。
 TEMPLATE_ROIS = {
     "start_game.png": (0.25, 0.55, 0.75, 1.00),
-    "close_popup.png": (0.78, 0.04, 0.95, 0.28),
-    "close_popup_event.png": (0.78, 0.04, 0.95, 0.28),
+    # 左界须留到 0.70：版本更新公告类宽弹窗的 ✕ 中心在 0.78 屏宽处，
+    # 模板主体会伸到 0.78 左侧，框到 0.78 会把它裁掉导致匹配不到。
+    "close_popup.png": (0.70, 0.03, 0.96, 0.30),
+    "close_popup_event.png": (0.70, 0.03, 0.96, 0.30),
     "lainongchang.png": (0.00, 0.55, 0.55, 1.00),
     "refresh_pos.png": (0.75, 0.70, 1.00, 1.00),
     "oneclick_farm.png": (0.45, 0.35, 0.80, 0.80),

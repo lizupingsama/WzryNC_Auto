@@ -33,7 +33,26 @@ class TemplateMatchingTests(unittest.TestCase):
 
     def test_popup_roi_excludes_top_center_navigation(self):
         x1, _, _, _ = wzry_auto.TEMPLATE_ROIS["close_popup.png"]
-        self.assertGreaterEqual(x1, 0.75)
+        self.assertGreaterEqual(x1, 0.65)
+
+    def test_wide_announcement_popup_close_matches_at_roi_left_edge(self):
+        # 回归：版本更新公告类宽弹窗的 ✕ 中心在 0.78 屏宽处（实测 3200x1440
+        # 失败截图位于 (2495,199)），ROI 左界取 0.78 会裁掉模板主体导致
+        # step2 等不到弹窗而超时
+        template = wzry_auto.cv_imread(
+            ROOT / "assets" / "templates" / "3200x1440" / "close_popup.png"
+        )
+        th, tw = template.shape[:2]
+        canvas = np.zeros((1440, 3200, 3), dtype=np.uint8)
+        canvas[161:161 + th, 2458:2458 + tw] = template
+        with tempfile.TemporaryDirectory() as directory:
+            screenshot = Path(directory) / "announcement.png"
+            wzry_auto.cv_imwrite(screenshot, canvas)
+            result = wzry_auto.find_template("close_popup.png", str(screenshot))
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            (result["x"], result["y"]), (2458 + tw // 2, 161 + th // 2)
+        )
 
     def test_dedicated_template_scales_are_bounded(self):
         # 精确匹配的分辨率目录：预测比例为 1，尺度限制在 ±10%
