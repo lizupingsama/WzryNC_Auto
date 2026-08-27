@@ -293,107 +293,56 @@ def wait_or_farm_now(seconds):
 # ============================================================
 import json
 
-# 存储文件路径
-CYCLE_FILE = str(ASSETS_DIR / "crop_cycle.json")
+# 最佳浇水节点表（单位：分钟）。取自实测的"最佳三次浇水时机"：
+# 1h 档 0/20/40/44、8h 档 0/2h40/5h20/5h52、16h 档 0/5h20/10h40/11h44、
+# 32h 档 0/10h40/21h20/23h12。节点值直接与剩余成熟时间比较：
+# 剩余时间倒数到节点值的时刻浇水一次，节点 0 表示不再浇水、等成熟收获。
+# 浇水会缩短剩余时间，下一轮按新剩余时间自然落入更低的节点/档位，
+# 因此不能以"当前时刻 + 周期比例"重排（旧算法在剩余时间短时会把
+# 浇水间隔越排越小）。
+WATER_NODE_TIERS = [
+    (60,   [44, 40, 20, 0]),
+    (480,  [352, 320, 160, 0]),
+    (960,  [704, 640, 320, 0]),
+    (1920, [1392, 1280, 640, 0]),
+]
 
-def save_crop_cycle(crop_name, cycle_min):
-    """保存作物周期到文件"""
-    data = {
-        "crop_name": crop_name,
-        "cycle_min": cycle_min,
-        "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    with open(CYCLE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"  💾 已保存作物周期: {crop_name} = {cycle_min}分钟")
+def calculate_next_water_time(show_mature_time, now=None):
+    """按当前剩余成熟时间匹配档位，计算下次浇水（或收获）时间。
 
-def load_crop_cycle():
-    """从文件加载作物周期，返回 (crop_name, cycle_min) 或 (None, None)"""
-    if not os.path.exists(CYCLE_FILE):
-        return None, None
-    try:
-        with open(CYCLE_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        crop_name = data.get("crop_name")
-        cycle_min = data.get("cycle_min")
-        update_time = data.get("update_time", "未知")
-        print(f"  📂 读取存储周期: {crop_name} = {cycle_min}分钟 (更新于 {update_time})")
-        return crop_name, cycle_min
-    except:
-        return None, None
-
-def clear_crop_cycle():
-    """清除存储的作物周期（新种植时调用）"""
-    if os.path.exists(CYCLE_FILE):
-        os.remove(CYCLE_FILE)
-        print("  🗑️ 已清除旧作物周期记录")
-
-def calculate_plant_cycle_and_water_time(first_water_time, show_mature_time, save_if_fresh=False):
+    档位匹配：剩余 ≤ 1h → 1h 档；1h~8h → 8h 档；8h~16h → 16h 档；
+    其余 → 32h 档。档位内取小于等于剩余时间的最大节点，
+    下次浇水时间 = 成熟时间 - 节点值。
+    例：剩余 50 分钟 → 1h 档节点 44 → 6 分钟后（剩余 44 分钟时）浇水。
+    :param show_mature_time: 本次浇水后 OCR 读到的成熟时间 (datetime)
+    :param now: 当前时间，缺省取 datetime.now()（测试注入用）
+    :return: dict with tier_min, node_min, next_water(None=等成熟), mature_time
     """
-    根据第一次浇水时间 + 第一次浇水后显示的成熟时间
-    自动计算：作物周期、后续完美浇水时间、最终成熟时间
-    :param first_water_time: 第一次浇水时间 (datetime)
-    :param show_mature_time: 第一次浇水后显示的成熟时间 (datetime)
-    :param save_if_fresh: 如果是新种植（刚收获），保存计算的周期
-    :return: dict with plant_cycle_min, water2, water3, mature_time
-    """
-    time_format = "%m-%d %H:%M:%S"
-    
-    # 计算第一次浇水后剩余分钟
-    delta_sec = (show_mature_time - first_water_time).total_seconds()
-    remain_min = delta_sec / 60
-    print(f"  💧 第一次浇水后显示剩余时间：{remain_min:.2f} 分钟")
-    
-    # 优先使用存储的作物周期
-    stored_crop, stored_cycle = load_crop_cycle()
-    
-    # 剩余时间超过存储周期说明换过作物或记录过期，忽略存储值重新匹配
-    if stored_cycle is not None and not save_if_fresh and remain_min <= stored_cycle * 1.1:
-        cycle_min = stored_cycle
-        print(f"  ✅ 使用存储的作物周期：{stored_crop} = {cycle_min}分钟")
+    if now is None:
+        now = datetime.now()
+    remain_min = (show_mature_time - now).total_seconds() / 60
+    print(f"  💧 当前剩余成熟时间:{remain_min:.1f} 分钟")
+
+    tier_min, nodes = next(
+        ((d, ns) for d, ns in WATER_NODE_TIERS if remain_min <= d),
+        WATER_NODE_TIERS[-1],
+    )
+    node_min = max((n for n in nodes if n <= remain_min), default=0)
+    print(f"  🌱 匹配档位:{tier_min // 60} 小时档,浇水节点:剩余 {node_min} 分钟")
+
+    if node_min <= 0:
+        next_water = None
+        print(f"  🌾 已过最后浇水节点,等待成熟收获:{show_mature_time.strftime('%m-%d %H:%M:%S')}")
     else:
-        # 匹配作物原始周期（游戏固定5种作物）
-        plant_rules = [
-            {"cycle": 5, "remain": 5},       # 5分钟
-            {"cycle": 60, "remain": 55},     # 1小时
-            {"cycle": 480, "remain": 400},   # 8小时
-            {"cycle": 960, "remain": 800},   # 16小时
-            {"cycle": 1920, "remain": 1600}, # 32小时
-        ]
-        
-        # 找最接近的作物周期
-        best_match = min(plant_rules, key=lambda x: abs(x["remain"] - remain_min))
-        cycle_min = best_match["cycle"]
-        
-        # 如果是新种植，保存计算的周期
-        if save_if_fresh:
-            save_crop_cycle("作物", cycle_min)
-            print(f"  💾 新种植，已保存周期：{cycle_min}分钟")
-        else:
-            print(f"  ⚠️ 无存储周期，自动匹配为：{cycle_min}分钟")
-    
-    cycle_hour = cycle_min // 60
-    
-    # 计算完美浇水时间点（从第一次浇水开始算）
-    water2_rel = cycle_min / 3
-    water3_rel = cycle_min * 2 / 3
-    water4_rel = cycle_min * 11 / 15  # 第四次 = 完美成熟
-    
-    # 转换为真实时间
-    water2_time = first_water_time + timedelta(minutes=water2_rel)
-    water3_time = first_water_time + timedelta(minutes=water3_rel)
-    water4_time = first_water_time + timedelta(minutes=water4_rel)
-    
-    print(f"  🌱 作物原始周期：{cycle_hour} 小时（{cycle_min} 分钟）")
-    print(f"  💧 第二次完美浇水时间：{water2_time.strftime(time_format)}")
-    print(f"  💧 第三次完美浇水时间：{water3_time.strftime(time_format)}")
-    print(f"  🌾 第四次浇水（成熟收获）：{water4_time.strftime(time_format)}")
-    
+        next_water = show_mature_time - timedelta(minutes=node_min)
+        print(f"  💧 下次浇水时间:{next_water.strftime('%m-%d %H:%M:%S')}"
+              f"(约 {remain_min - node_min:.1f} 分钟后)")
+
     return {
-        "plant_cycle_min": cycle_min,
-        "water2": water2_time,
-        "water3": water3_time,
-        "mature_time": water4_time
+        "tier_min": tier_min,
+        "node_min": node_min,
+        "next_water": next_water,
+        "mature_time": show_mature_time,
     }
 
 # ============================================================
@@ -1384,9 +1333,9 @@ def step8_close_harvest():
     print("\n[步骤8] 关闭收获弹窗...")
     harvested = False
     
-    for attempt in range(3):
+    for attempt in range(2):
         screenshot(SCREENSHOT_PATH)
-        
+
         if has_template("harvest_continue.png", SCREENSHOT_PATH):
             print("  ✅ 找到收获弹窗")
             harvested = True
@@ -1414,20 +1363,18 @@ def step8_close_harvest():
             time.sleep(5)
             return True, harvested
         else:
-            print(f"  ⚠️ 未找到收获弹窗，等待3秒后重试 ({attempt+1}/3)")
+            print(f"  ⚠️ 未找到收获弹窗，等待3秒后重试 ({attempt+1}/2)")
             time.sleep(3)
-    
-    print("  ⚠️ 连续3次未找到收获弹窗，进入步骤9")
+
+    print("  ⚠️ 连续2次未找到收获弹窗，进入步骤9")
     return False, False
 
 # ============================================================
 # 步骤9: 移动到土地
 # ============================================================
-def step9_move_to_farmland(first_water_time, save_if_fresh=False):
-    """步骤9: 移动到土地，读取成熟时间，计算浇水计划
+def step9_move_to_farmland():
+    """步骤9: 移动到土地，读取成熟时间，计算下次浇水时间
 
-    :param first_water_time: 一键务农时间（由main传入，在移动前记录）
-    :param save_if_fresh: 如果是新种植（刚收获），保存计算的周期
     :return: (result, maturity_dt, is_mature)
     """
     print("\n[步骤9] 移动到土地...")
@@ -1446,10 +1393,10 @@ def step9_move_to_farmland(first_water_time, save_if_fresh=False):
         print("  🌾 作物已成熟，无需等待")
         return None, None, True
 
-    # 计算浇水计划
+    # 计算下次浇水时间
     result = None
     if maturity_dt:
-        result = calculate_plant_cycle_and_water_time(first_water_time, maturity_dt, save_if_fresh=save_if_fresh)
+        result = calculate_next_water_time(maturity_dt)
 
     return result, maturity_dt, False
 
@@ -1489,8 +1436,8 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
     reason = ""
     
     if result and maturity_dt:
-        # 获取下次浇水时间（water2）
-        next_watering = result.get("water2")
+        # 获取下次浇水时间（None 表示已过最后节点，等成熟）
+        next_watering = result.get("next_water")
         
         if next_watering and next_watering < maturity_dt:
             wake_time = next_watering
@@ -1778,11 +1725,11 @@ def main():
             step6_move_to_statue()
         
             # 步骤7: 一键务农
-            farm_ok, first_water_time = step7_oneclick_farm()
+            farm_ok, _ = step7_oneclick_farm()
             if not farm_ok:
                 print("\n⚠️ 步骤7失败，返回步骤6...")
                 step6_move_to_statue()
-                farm_ok, first_water_time = step7_oneclick_farm()
+                farm_ok, _ = step7_oneclick_farm()
             if not farm_ok:
                 print("\n❌ 步骤7连续失败，本轮结束")
                 stats.finish_round("失败：未找到一键务农")
@@ -1791,10 +1738,10 @@ def main():
                 continue
         
             # 步骤8: 关闭收获弹窗
-            _, harvested = step8_close_harvest()
-        
-            # 步骤9: 移动到土地，读取成熟时间，计算浇水计划
-            result, maturity_dt, is_mature = step9_move_to_farmland(first_water_time, save_if_fresh=harvested)
+            step8_close_harvest()
+
+            # 步骤9: 移动到土地，读取成熟时间，计算下次浇水时间
+            result, maturity_dt, is_mature = step9_move_to_farmland()
 
             # 步骤10: 计算等待时间，返回唤醒时间
             wake_time = step10_calculate_wait(result, maturity_dt, is_mature)

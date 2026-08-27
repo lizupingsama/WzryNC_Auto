@@ -324,31 +324,44 @@ class MaturityParsingTests(unittest.TestCase):
         maturity_dt, _ = self._read_maturity_with("明天14:00成熟", fake_now)
         self.assertEqual(maturity_dt, datetime(2026, 8, 27, 14, 0, 0))
 
-    def test_cross_day_remaining_matches_32h_crop(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cycle_file = Path(directory) / "crop_cycle.json"
-            with patch.object(wzry_auto, "CYCLE_FILE", str(cycle_file)):
-                first_water = datetime(2026, 8, 26, 13, 7, 0)
-                result = wzry_auto.calculate_plant_cycle_and_water_time(
-                    first_water, first_water + timedelta(minutes=1759),
-                    save_if_fresh=True,
-                )
-        self.assertEqual(result["plant_cycle_min"], 1920)
+    def test_cross_day_remaining_matches_32h_tier(self):
+        # 剩余1759分钟（29小时19分）→ 32小时档，节点23h12（1392分钟）
+        now = datetime(2026, 8, 26, 13, 7, 0)
+        result = wzry_auto.calculate_next_water_time(
+            now + timedelta(minutes=1759), now=now
+        )
+        self.assertEqual(result["tier_min"], 1920)
+        self.assertEqual(result["node_min"], 1392)
+        self.assertEqual(result["next_water"], now + timedelta(minutes=1759 - 1392))
 
-    def test_stale_stored_cycle_is_ignored(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cycle_file = Path(directory) / "crop_cycle.json"
-            cycle_file.write_text(
-                json.dumps({"crop_name": "作物", "cycle_min": 60}),
-                encoding="utf-8",
-            )
-            with patch.object(wzry_auto, "CYCLE_FILE", str(cycle_file)):
-                first_water = datetime(2026, 8, 25, 10, 0, 0)
-                # 剩余300分钟 > 存储周期60分钟，应忽略存储值重新匹配到480
-                result = wzry_auto.calculate_plant_cycle_and_water_time(
-                    first_water, first_water + timedelta(minutes=300)
-                )
-        self.assertEqual(result["plant_cycle_min"], 480)
+    def test_short_remaining_uses_tier_node_not_rebase(self):
+        # 回归：剩余50分钟 → 1小时档节点44 → 6分钟后浇水，
+        # 而不是以当前时刻为基准按周期比例重排
+        now = datetime(2026, 8, 26, 10, 0, 0)
+        result = wzry_auto.calculate_next_water_time(
+            now + timedelta(minutes=50), now=now
+        )
+        self.assertEqual(result["tier_min"], 60)
+        self.assertEqual(result["node_min"], 44)
+        self.assertEqual(result["next_water"], now + timedelta(minutes=6))
+
+    def test_mid_remaining_matches_8h_tier(self):
+        # 剩余300分钟（5小时）→ 8小时档，节点2h40（160分钟）
+        now = datetime(2026, 8, 25, 10, 0, 0)
+        result = wzry_auto.calculate_next_water_time(
+            now + timedelta(minutes=300), now=now
+        )
+        self.assertEqual(result["tier_min"], 480)
+        self.assertEqual(result["next_water"], now + timedelta(minutes=300 - 160))
+
+    def test_past_last_node_waits_for_mature(self):
+        # 剩余15分钟已低于1小时档最后节点20，不再浇水，等成熟收获
+        now = datetime(2026, 8, 26, 10, 0, 0)
+        result = wzry_auto.calculate_next_water_time(
+            now + timedelta(minutes=15), now=now
+        )
+        self.assertIsNone(result["next_water"])
+        self.assertEqual(result["mature_time"], now + timedelta(minutes=15))
 
 
 class StatsTests(unittest.TestCase):
