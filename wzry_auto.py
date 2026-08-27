@@ -7,6 +7,7 @@
 
 import cv2
 import numpy as np
+import re
 import subprocess
 import time
 import math
@@ -18,16 +19,20 @@ import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 
-# Windows 中文系统下 stdout 走管道/重定向时默认 GBK，无法编码 emoji 输出。
+# Windows 中文系统下 stdout 走管道/重定向时默认 GBK，无法编码 emoji 输出；
+# line_buffering 保证走管道时日志逐行实时到达 GUI（含 PyInstaller 打包后）。
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 # ============================================================
 # 配置
 # ============================================================
-SCRIPT_DIR = Path(__file__).parent
+# PyInstaller 打包后 __file__ 指向内部资源目录，改用 exe 所在目录，
+# 让 assets、diagnostics、统计文件与可执行文件同级（绿色便携）。
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+SCRIPT_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).parent
 ASSETS_DIR = SCRIPT_DIR / "assets"
 TEMPLATE_DIR = ASSETS_DIR / "templates"
 SCREENSHOT_PATH = str(ASSETS_DIR / "current.png")
@@ -39,14 +44,23 @@ SCREEN_OFF_WAIT_SECONDS = 180
 GAME_PKG = "com.tencent.tmgp.sgame"
 GAME_ACT = f"{GAME_PKG}/com.tencent.tmgp.sgame.SGameActivity"
 
-# 模拟器配置
-import shutil as _shutil
-_ADB = os.environ.get("WZRY_ADB") or _shutil.which("adb") or (
-    "/home/lili/android-tools/platform-tools/adb"
-    if Path("/home/lili/android-tools/platform-tools/adb").exists()
-    else "/tmp/platform-tools/adb" if Path("/tmp/platform-tools/adb").exists() else "adb"
-)
-ADB = _ADB
+# ADB 解析顺序：显式 WZRY_ADB > 随程序分发的 platform-tools > PATH > 常见安装位置
+def _find_adb():
+    explicit = os.environ.get("WZRY_ADB")
+    if explicit:
+        return explicit
+    bundled = SCRIPT_DIR / "platform-tools" / ("adb.exe" if os.name == "nt" else "adb")
+    if bundled.exists():
+        return str(bundled)
+    found = shutil.which("adb")
+    if found:
+        return found
+    for candidate in ("/home/lili/android-tools/platform-tools/adb", "/tmp/platform-tools/adb"):
+        if Path(candidate).exists():
+            return candidate
+    return "adb"
+
+ADB = _find_adb()
 DEVICE = os.environ.get("WZRY_DEVICE", "")
 DEFAULT_DEVICE = os.environ.get("WZRY_DEFAULT_DEVICE", "")
 UNLOCK_PWD = os.environ.get("WZRY_UNLOCK_PWD", "")  # 锁屏密码，为空则不输入密码
@@ -285,7 +299,7 @@ def calculate_plant_cycle_and_water_time(first_water_time, show_mature_time, sav
     :param save_if_fresh: 如果是新种植（刚收获），保存计算的周期
     :return: dict with plant_cycle_min, water2, water3, mature_time
     """
-    time_format = "%H:%M:%S"
+    time_format = "%m-%d %H:%M:%S"
     
     # 计算第一次浇水后剩余分钟
     delta_sec = (show_mature_time - first_water_time).total_seconds()
@@ -406,7 +420,7 @@ def wake_and_unlock(password=""):
             adb_shell("settings put system screen_brightness 1")
     
     # 唤醒屏幕
-    adb_shell("input keyevent KEYCODE_WAKEUP")
+    adb_input("input keyevent KEYCODE_WAKEUP")
     time.sleep(1)
     
     # 按设备物理尺寸计算解锁手势，兼容手机和模拟器。
@@ -419,7 +433,7 @@ def wake_and_unlock(password=""):
     else:
         portrait_w, portrait_h = 1080, 2400
     unlock_x = portrait_w // 2
-    adb_shell(
+    adb_input(
         f"input swipe {unlock_x} {int(portrait_h * 0.75)} "
         f"{unlock_x} {int(portrait_h * 0.25)} 300"
     )
@@ -428,9 +442,9 @@ def wake_and_unlock(password=""):
     # 输入密码
     if password:
         print("  🔑 输入密码...")
-        adb_shell(f"input text {password}")
+        adb_input(f"input text {password}")
         time.sleep(0.5)
-        adb_shell("input keyevent 66")  # 回车确认
+        adb_input("input keyevent 66")  # 回车确认
         time.sleep(2)
     
     print("  ✅ 屏幕已唤醒并解锁")
@@ -610,14 +624,26 @@ def cv_imwrite(path, img):
     return bool(ok)
 
 def screenshot(path=SCREENSHOT_PATH):
-    """截图；高分辨率设备压缩 PNG 较慢，放宽超时，失败时清除旧图避免误用陈旧画面。"""
+    """截图；经 exec-out 流式读取由 Python 落盘。
+    不能用 adb pull 写本地文件：platform-tools 35+ 在 Windows 上遇到含中文的
+    本地路径会报 cannot create file/directory（且行为不稳定），打包目录名
+    「王者农场助手」正好踩中。失败时清除旧图避免误用陈旧画面。"""
     try:
-        adb_shell("screencap -p /sdcard/screen.png", timeout=30)
-        adb_command("pull", "/sdcard/screen.png", path, timeout=30)
+        result = subprocess.run(
+            [ADB, "-s", DEVICE, "exec-out", "screencap", "-p"],
+            capture_output=True, timeout=30,
+        )
     except subprocess.TimeoutExpired:
         print("  ⚠️ 截图超时，跳过本次画面")
         Path(path).unlink(missing_ok=True)
         return path
+    data = result.stdout
+    if result.returncode != 0 or not data.startswith(b"\x89PNG"):
+        err = result.stderr.decode("utf-8", "replace").strip()
+        print(f"  ⚠️ 截图失败: {err or '设备无响应'}")
+        Path(path).unlink(missing_ok=True)
+        return path
+    Path(path).write_bytes(data)
     # 自动旋转：竖屏截图 → 横屏
     img = cv_imread(path)
     if img is not None:
@@ -639,23 +665,49 @@ def detect_resolution():
         return w, h
     return 1280, 720
 
+def adb_input(cmd):
+    """执行 input 注入并暴露失败原因。
+    小米/红米未开启「USB调试（安全设置）」时 input 抛 SecurityException，
+    但只写入 stderr，静默吞掉就会表现成"识别到但点不到"。"""
+    result = adb_command("shell", cmd, timeout=10)
+    noise = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+    if "Exception" in noise or "INJECT_EVENTS" in noise or "permission" in noise.lower():
+        print(f"  🚫 输入注入被系统拒绝: {noise.splitlines()[0][:120]}")
+        print("     ➜ 小米/红米需在开发者选项开启「USB调试（安全设置）」（需登录小米账号+插SIM卡），开启后重新插拔数据线")
+    return result
+
 def tap(x, y, label=""):
     """点击屏幕"""
     if label:
         print(f"  👆 tap ({x}, {y}) [{label}]")
-    adb_shell(f"input tap {x} {y}")
+    adb_input(f"input tap {x} {y}")
 
 def swipe(x1, y1, x2, y2, duration_ms=1000):
     """滑动"""
-    adb_shell(f"input swipe {x1} {y1} {x2} {y2} {duration_ms}")
+    adb_input(f"input swipe {x1} {y1} {x2} {y2} {duration_ms}")
 
 # ============================================================
 # 模板匹配
 # ============================================================
-def _template_scales(tdir, img_w, img_h):
+_RES_DIR_RE = re.compile(r"^(\d+)x(\d+)$")
+
+def _template_dirs(img_w, img_h):
+    """模板搜索路径：精确分辨率 > 其他分辨率目录（高度接近者优先）> 默认目录。"""
+    res_dirs = []
+    for entry in TEMPLATE_DIR.iterdir():
+        match = _RES_DIR_RE.match(entry.name)
+        if entry.is_dir() and match:
+            res_dirs.append((entry, (int(match.group(1)), int(match.group(2)))))
+    res_dirs.sort(key=lambda item: abs(item[1][1] - img_h))
+    return res_dirs + [(TEMPLATE_DIR, None)]
+
+def _template_scales(img_w, img_h, src_size):
     """返回有限且可解释的模板尺度，避免把按钮放大到整屏宽。"""
-    if tdir != TEMPLATE_DIR:
-        return [0.90, 0.95, 1.0, 1.05, 1.10]
+    if src_size is not None:
+        # 游戏 UI 按屏幕高度等比缩放，宽度差异只是两侧留边，
+        # 因此其他分辨率的模板按高度比例预缩放即可在新设备上复用。
+        predicted = img_h / src_size[1]
+        return [round(predicted * f, 3) for f in (0.90, 0.95, 1.0, 1.05, 1.10)]
 
     predicted = min(img_w / BASE_W, img_h / BASE_H)
     scales = {0.75, 1.0, 1.25, 1.5, 2.0}
@@ -681,29 +733,22 @@ def find_template(template_name, screenshot_path, threshold=None, roi=None):
         x1, y1, x2, y2 = 0, 0, img_w, img_h
     search_img = img[y1:y2, x1:x2]
     
-    # 构建模板搜索路径：分辨率专用 > 默认
-    template_dirs = []
-    res_dir = TEMPLATE_DIR / f"{img_w}x{img_h}"
-    if res_dir.exists():
-        template_dirs.append(res_dir)
-    template_dirs.append(TEMPLATE_DIR)
-    
     best_score = -1
     best_loc = None
     best_tw, best_th = 0, 0
-    
-    for tdir in template_dirs:
+
+    for tdir, src_size in _template_dirs(img_w, img_h):
         template_path = tdir / template_name
         if not template_path.exists():
             continue
-        
+
         tmpl = cv_imread(template_path)
         if tmpl is None:
             continue
-        
+
         tmpl_h, tmpl_w = tmpl.shape[:2]
-        scales = _template_scales(tdir, img_w, img_h)
-        
+        scales = _template_scales(img_w, img_h, src_size)
+
         for s in scales:
             if abs(s - 1.0) < 0.01:
                 t = tmpl
@@ -723,7 +768,11 @@ def find_template(template_name, screenshot_path, threshold=None, roi=None):
                 best_score = max_val
                 best_loc = (max_loc[0] + x1, max_loc[1] + y1)
                 best_tw, best_th = tw, th
-    
+
+        # 高优先级目录已达标则停止，后面的目录只在未达标时兜底
+        if best_score >= threshold:
+            break
+
     if best_loc is None:
         print(f"  ❌ '{template_name}': 模板不存在")
         return None
@@ -848,8 +897,8 @@ def parse_relative_maturity(text):
 def read_maturity_time(screenshot_path):
     """从截图中读取成熟时间
     支持绝对时间（"18:25成熟"）与相对时间（"17分钟后成熟"）两种界面格式。
-    返回: ((hour, minute), is_mature)
-        - 识别到时间: ((hour, minute), False)
+    返回: (maturity_dt, is_mature)
+        - 识别到时间: (datetime, False)，完整日期时间，跨天信息不丢失
         - 作物已成熟可收获: (None, True)
         - 无法识别: (None, False)
     """
@@ -880,8 +929,8 @@ def read_maturity_time(screenshot_path):
             if rel_min <= 0:
                 return None, True
             target = datetime.now() + timedelta(minutes=rel_min)
-            print(f"  🕐 OCR识别: {rel_min}分钟后成熟 → {target.strftime('%H:%M')}")
-            return (target.hour, target.minute), False
+            print(f"  🕐 OCR识别: {rel_min}分钟后成熟 → {target.strftime('%m-%d %H:%M')}")
+            return target, False
 
         # 匹配成熟时间（如 "18:25成熟"、"明天00：02成熟"，兼容全角冒号）
         for line in result:
@@ -890,8 +939,15 @@ def read_maturity_time(screenshot_path):
             if time_match:
                 hour = int(time_match.group(1))
                 minute = int(time_match.group(2))
-                print(f"  🕐 OCR识别: {hour}点{minute:02d}分")
-                return (hour, minute), False
+                if hour >= 24 or minute >= 60:
+                    continue
+                now = datetime.now()
+                target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                # 带"明天"前缀或时刻已过均按次日处理
+                if "明天" in text or target <= now:
+                    target += timedelta(days=1)
+                print(f"  🕐 OCR识别: {target.strftime('%m-%d %H:%M')}成熟")
+                return target, False
 
     return None, False
 
@@ -1284,49 +1340,40 @@ def step8_close_harvest():
 # ============================================================
 def step9_move_to_farmland(first_water_time, save_if_fresh=False):
     """步骤9: 移动到土地，读取成熟时间，计算浇水计划
-    
+
     :param first_water_time: 一键务农时间（由main传入，在移动前记录）
     :param save_if_fresh: 如果是新种植（刚收获），保存计算的周期
+    :return: (result, maturity_dt, is_mature)
     """
     print("\n[步骤9] 移动到土地...")
-    
+
     # 向上方移动
     move_joystick(90, 200, 1200)  # 90度是正上方
     print("  ⏳ 等待移动...")
     time.sleep(5)
-    
+
     # 截图OCR
     screenshot(SCREENSHOT_PATH)
-    maturity_time, is_mature = read_maturity_time(SCREENSHOT_PATH)
-    
+    maturity_dt, is_mature = read_maturity_time(SCREENSHOT_PATH)
+
     # 如果作物已成熟（可收获），不需要等待
     if is_mature:
         print("  🌾 作物已成熟，无需等待")
-        return None, None, None, True
-    
+        return None, None, True
+
     # 计算浇水计划
     result = None
-    maturity_dt = None
-    
-    if maturity_time:
-        hour, minute = maturity_time
-        # OCR读取的是成熟时间（绝对时间）
-        maturity_dt = first_water_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if maturity_dt <= first_water_time:
-            maturity_dt += timedelta(days=1)
-        
-        # 调用新的浇水计算函数
+    if maturity_dt:
         result = calculate_plant_cycle_and_water_time(first_water_time, maturity_dt, save_if_fresh=save_if_fresh)
 
-    return maturity_time, result, maturity_dt, False
+    return result, maturity_dt, False
 
 # ============================================================
 # 步骤10: 计算等待时间
 # ============================================================
-def step10_calculate_wait(maturity_time, result, maturity_dt, is_mature=False):
+def step10_calculate_wait(result, maturity_dt, is_mature=False):
     """步骤10: 根据成熟时间和浇水时间计算等待时间
 
-    :param maturity_time: OCR识别的 (hour, minute) 元组
     :param result: 浇水计算结果 dict
     :param maturity_dt: 成熟时间 (datetime)
     :param is_mature: 作物已成熟可收获（与"识别失败"明确区分）
@@ -1361,15 +1408,15 @@ def step10_calculate_wait(maturity_time, result, maturity_dt, is_mature=False):
         if next_watering and next_watering < maturity_dt:
             wake_time = next_watering
             reason = "浇水"
-            print(f"  💧 下次浇水时间: {next_watering.strftime('%H:%M:%S')} (早于成熟时间)")
+            print(f"  💧 下次浇水时间: {next_watering.strftime('%m-%d %H:%M:%S')} (早于成熟时间)")
         else:
             wake_time = maturity_dt
             reason = "成熟"
-            print(f"  🌾 成熟时间: {maturity_dt.strftime('%H:%M:%S')} (早于浇水时间)")
+            print(f"  🌾 成熟时间: {maturity_dt.strftime('%m-%d %H:%M:%S')} (早于浇水时间)")
     elif maturity_dt:
         wake_time = maturity_dt
         reason = "成熟"
-        print(f"  🌾 成熟时间: {maturity_dt.strftime('%H:%M:%S')}")
+        print(f"  🌾 成熟时间: {maturity_dt.strftime('%m-%d %H:%M:%S')}")
     else:
         print("  ⚠️ 无法识别时间，5分钟后重试...")
         retry_time = now + timedelta(minutes=5)
@@ -1390,38 +1437,71 @@ def step10_calculate_wait(maturity_time, result, maturity_dt, is_mature=False):
     seconds = wait_seconds % 60
     
     print(f"  🎯 目标时间: {(wake_time + timedelta(minutes=2)).strftime('%H:%M:%S')} ({reason})")
-    print(f"  🔔 提前2分钟唤醒: {wake_time.strftime('%H:%M:%S')}")
+    print(f"  🔔 提前2分钟唤醒: {wake_time.strftime('%m-%d %H:%M:%S')}")
     print(f"  ⏳ 等待 {hours}小时{minutes}分{seconds:02d}秒")
     stats.set_next_wake(wake_time, wake_time + timedelta(minutes=2), reason)
     return wake_time
 # ============================================================
 # 主流程
 # ============================================================
+def is_wireless_device(serial=None):
+    """网络设备地址形如 ip:port；USB 序列号不含冒号。"""
+    return ":" in (serial if serial is not None else DEVICE)
+
+def adb_host_command(*args, timeout=15):
+    """执行不针对具体设备的 adb 主机命令（connect/disconnect 等）。"""
+    return subprocess.run(
+        [ADB, *map(str, args)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout,
+    )
+
+def _device_state_ok():
+    try:
+        result = adb_command("get-state")
+        return result.returncode == 0 and result.stdout.strip() == "device"
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+def ensure_device_connected(max_attempts=6, retry_interval=10):
+    """确认设备在线；无线设备掉线时自动 adb connect 重连。
+
+    作物成熟等待动辄数小时，手机省电或路由器常把空闲的 WiFi ADB 断开，
+    因此每轮开始前都要调用，尽力恢复连接而不是让整轮流程失败。
+    """
+    for attempt in range(1, max_attempts + 1):
+        if _device_state_ok():
+            if attempt > 1:
+                print(f"  ✅ 设备重连成功: {DEVICE}")
+            return True
+        if not is_wireless_device():
+            print(f"  ❌ USB 设备离线: {DEVICE}，请检查数据线连接")
+            return False
+        print(f"  🔄 无线设备离线，尝试重连 ({attempt}/{max_attempts}): {DEVICE}")
+        try:
+            # 先断开残留的半死连接，否则 connect 可能直接返回 already connected
+            adb_host_command("disconnect", DEVICE)
+            out = adb_host_command("connect", DEVICE).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            out = ""
+        if "connected to" in out and _device_state_ok():
+            print(f"  ✅ 设备重连成功: {DEVICE}")
+            return True
+        if attempt < max_attempts:
+            time.sleep(retry_interval)
+    print(f"  ❌ 无法恢复设备连接: {DEVICE}")
+    return False
+
 def check_adb_connection():
-    """检查ADB连接状态，未连接则自动连接"""
+    """启动前检查ADB连接状态，未连接则自动连接（无线设备带重试）。"""
     print("🔍 检查ADB连接...")
     if not DEVICE:
         print("  ❌ 未选择设备")
         return False
-    result = adb_command("get-state")
-    if result.returncode == 0 and result.stdout.strip() == "device":
+    if ensure_device_connected(max_attempts=3, retry_interval=5):
         print(f"  ✅ 设备已连接: {DEVICE}")
         return True
-    
-    # 自动连接
-    print(f"  ⚠️ 设备未连接，正在自动连接: {DEVICE}")
-    connect_result = subprocess.run(
-        [ADB, "connect", DEVICE],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=10,
-    )
-    
-    if "connected" in connect_result.stdout:
-        print(f"  ✅ 自动连接成功: {DEVICE}")
-        return True
-    else:
-        print(f"  ❌ 自动连接失败: {connect_result.stdout.strip()}")
-        return False
+    return False
 
 def resolve_device():
     """优先使用环境变量；否则单设备自动选择，多设备要求显式指定。"""
@@ -1554,6 +1634,21 @@ def main():
         print(f"{'='*60}")
         
         try:
+            # 长等待后无线 ADB 常被省电策略断开，先确保连接可用再操作。
+            # 设备不在线（如带手机外出）只记一轮失败，之后原地每5分钟重试，
+            # 恢复后自动继续挂机，不把离线期间刷成一长串失败轮次。
+            if not ensure_device_connected():
+                stats.finish_round("失败：设备离线")
+                print("  ⏳ 设备离线，每30秒重试，恢复连接后自动继续...")
+                while True:
+                    retry_at = datetime.now() + timedelta(seconds=30)
+                    stats.set_next_wake(retry_at, retry_at, "设备离线，等待重连")
+                    time.sleep(30)
+                    if ensure_device_connected(max_attempts=1):
+                        print("  ✅ 设备恢复连接，继续挂机")
+                        break
+                continue
+
             # 唤醒屏幕并解锁（首轮启动或长等待后手机可能处于息屏状态）
             wake_and_unlock(UNLOCK_PWD)
 
@@ -1609,10 +1704,10 @@ def main():
             _, harvested = step8_close_harvest()
         
             # 步骤9: 移动到土地，读取成熟时间，计算浇水计划
-            maturity_time, result, maturity_dt, is_mature = step9_move_to_farmland(first_water_time, save_if_fresh=harvested)
+            result, maturity_dt, is_mature = step9_move_to_farmland(first_water_time, save_if_fresh=harvested)
 
             # 步骤10: 计算等待时间，返回唤醒时间
-            wake_time = step10_calculate_wait(maturity_time, result, maturity_dt, is_mature)
+            wake_time = step10_calculate_wait(result, maturity_dt, is_mature)
         
             if wake_time is None:
                 # 作物已成熟，立即重新开始
@@ -1626,14 +1721,16 @@ def main():
                 wait_seconds = int((wake_time - now).total_seconds())
                 if wait_seconds > SCREEN_OFF_WAIT_SECONDS:
                     print("  🌙 等待较长，熄灭手机屏幕")
-                    adb_shell("input keyevent KEYCODE_SLEEP")
-                print(f"\n⏳ 等待到 {wake_time.strftime('%H:%M:%S')} 唤醒...")
+                    adb_input("input keyevent KEYCODE_SLEEP")
+                print(f"\n⏳ 等待到 {wake_time.strftime('%m-%d %H:%M:%S')} 唤醒...")
                 time.sleep(wait_seconds)
             # 醒屏和解锁在下一轮循环开头统一处理
         except subprocess.TimeoutExpired as exc:
-            # 设备偶发无响应（USB抖动、高负载卡顿）不应终止挂机，放弃本轮稍后重试。
+            # 设备偶发无响应（USB抖动、无线掉线、高负载卡顿）不应终止挂机，
+            # 放弃本轮稍后重试；无线掉线常表现为命令超时，先尝试重连。
             print(f"\n⚠️ ADB 命令超时，放弃本轮，30秒后重试: {exc}")
             stats.finish_round("失败：ADB命令超时")
+            ensure_device_connected(max_attempts=3, retry_interval=10)
             force_stop_game()
             time.sleep(30)
 
@@ -1677,5 +1774,63 @@ def run_main():
         restore_brightness()
         print("\n👋 脚本已退出")
 
+def run_selftest():
+    """打包/环境自检：验证依赖、模板、OCR 与 adb 可用（不连设备、不动游戏）。"""
+    import traceback
+    failures = []
+    print("=" * 60)
+    print("王者农场助手 自检")
+    print(f"  Python {sys.version.split()[0]}  frozen={IS_FROZEN}")
+    print(f"  程序目录: {SCRIPT_DIR}")
+    print(f"  OpenCV {cv2.__version__} / NumPy {np.__version__}")
+
+    templates = sorted(TEMPLATE_DIR.rglob("*.png")) if TEMPLATE_DIR.exists() else []
+    print(f"  模板目录: {TEMPLATE_DIR}（{len(templates)} 张）")
+    if not templates:
+        failures.append(f"模板缺失: {TEMPLATE_DIR}")
+    else:
+        sample = cv_imread(templates[0])
+        if sample is None:
+            failures.append(f"模板无法解码: {templates[0]}")
+        else:
+            print(f"  模板解码正常: {templates[0].name} {sample.shape[1]}x{sample.shape[0]}")
+
+    try:
+        canvas = np.full((64, 200, 3), 255, dtype=np.uint8)
+        cv2.putText(canvas, "12:34", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
+        get_ocr()(canvas)
+        print("  OCR 引擎初始化并推理成功")
+    except Exception as exc:
+        failures.append(f"OCR 引擎异常: {exc}")
+        traceback.print_exc()
+
+    print(f"  adb 路径: {ADB}")
+    try:
+        result = subprocess.run(
+            [ADB, "version"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
+        )
+        first = (result.stdout or result.stderr).strip().splitlines()
+        print(f"  adb 可执行: {first[0] if first else '(无输出)'}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        failures.append(f"adb 不可执行: {exc}")
+
+    try:
+        sys.path.insert(0, str(SCRIPT_DIR / "scripts"))
+        import stats_server  # noqa: F401
+        print("  统计面板模块可导入")
+    except Exception as exc:
+        failures.append(f"统计面板模块导入失败: {exc}")
+
+    print("=" * 60)
+    if failures:
+        for item in failures:
+            print(f"❌ {item}")
+        return 1
+    print("✅ SELFTEST OK")
+    return 0
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(run_selftest())
     run_main()

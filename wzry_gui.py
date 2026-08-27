@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """王者农场挂机助手 —— 图形界面 + 系统托盘外壳
 
-以子进程方式运行 wzry_auto.py：
+以子进程方式运行挂机核心（脚本模式 wzry_auto.py / 打包模式 wzry_core.exe）：
 - 窗口内实时显示脚本日志、累计统计与下次唤醒倒计时
 - 点击关闭按钮最小化到系统托盘，不占用任务栏
 - 托盘菜单：显示主界面 / 启动挂机 / 停止挂机 / 统计面板 / 退出
 - 停止时通过 stdin 管道通知脚本优雅退出（退出游戏、恢复手机亮度）；
   即使助手被强杀，子进程也会因管道 EOF 自行退出，不会留孤儿进程
 
+界面基于 CustomTkinter（圆角控件、深浅色主题、跟随系统外观）。
 请使用 start_gui.bat（首次运行，安装依赖）或 启动农场助手.vbs（日常静默启动）。
 """
 
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -26,17 +28,34 @@ from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# PyInstaller 打包后 __file__ 指向内部资源目录，改用 exe 所在目录；
+# 打包模式下挂机核心是同目录的 wzry_core.exe，脚本模式下仍是 wzry_auto.py。
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+SCRIPT_DIR = (
+    Path(sys.executable).resolve().parent if IS_FROZEN
+    else Path(__file__).resolve().parent
+)
 ASSETS_DIR = SCRIPT_DIR / "assets"
 MAIN_SCRIPT = SCRIPT_DIR / "wzry_auto.py"
+CORE_EXE = SCRIPT_DIR / "wzry_core.exe"
 STATS_FILE = ASSETS_DIR / "stats.json"
 CONFIG_FILE = ASSETS_DIR / "gui_config.json"
 ERROR_LOG = ASSETS_DIR / "gui_error.log"
 
 APP_TITLE = "王者农场挂机助手"
 STATS_PORT = int(os.environ.get("WZRY_STATS_PORT", "8765"))
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    _root = tk.Tk()
+    _root.withdraw()
+    messagebox.showerror(
+        APP_TITLE, "缺少界面依赖 customtkinter。\n请运行 start_gui.bat 安装依赖后重试。",
+    )
+    raise
 
 # 亮度选项：显示文本 -> 传给脚本的 WZRY_BRIGHTNESS 值
 BRIGHTNESS_OPTIONS = [
@@ -46,42 +65,31 @@ BRIGHTNESS_OPTIONS = [
     ("ROOT 亮度 1", "1"),
 ]
 
-# 亮/暗主题配色（ttk 的 clam 主题全部颜色可配置）
-THEMES = {
-    "light": {
-        "bg": "#f3f3f3",
-        "fg": "#1f1f1f",
-        "muted": "#767676",
-        "accent": "#1565c0",
-        "running": "#2e7d32",
-        "stopping": "#e65100",
-        "border": "#c8c8c8",
-        "button_bg": "#e5e5e5",
-        "button_active": "#d5d5d5",
-        "entry_bg": "#ffffff",
-        "text_bg": "#ffffff",
-        "text_fg": "#1f1f1f",
-        "select_bg": "#bcd8f5",
-    },
-    "dark": {
-        "bg": "#202020",
-        "fg": "#e6e6e6",
-        "muted": "#9e9e9e",
-        "accent": "#64b5f6",
-        "running": "#81c784",
-        "stopping": "#ffb74d",
-        "border": "#3c3c3c",
-        "button_bg": "#2d2d2d",
-        "button_active": "#3a3a3a",
-        "entry_bg": "#2b2b2b",
-        "text_bg": "#171717",
-        "text_fg": "#dcdcdc",
-        "select_bg": "#264f78",
-    },
+# 外观选项：显示文本 -> customtkinter 外观模式
+APPEARANCE_OPTIONS = [
+    ("浅色", "light"),
+    ("深色", "dark"),
+    ("跟随系统", "system"),
+]
+
+# (浅色, 深色) 成对颜色，customtkinter 自动按当前外观取用
+MUTED = ("gray45", "gray60")
+ACCENT = ("#2FA572", "#2CC985")
+DISABLED_BTN = ("gray80", "gray28")
+STOP_FG = ("#D9534F", "#A94442")
+STOP_HOVER = ("#C9302C", "#8B3634")
+STATUS_COLORS = {
+    "idle": MUTED,
+    "running": ACCENT,
+    "stopping": ("#E8890C", "#F0A030"),
 }
 
-# 状态种类 -> 主题色键
-STATUS_COLOR_KEY = {"idle": "muted", "running": "running", "stopping": "stopping"}
+# 设备状态指示色：已连接 / 需要处理（未授权、离线）/ 未连接
+DEVICE_STATUS_COLORS = {
+    "ok": ACCENT,
+    "warn": STATUS_COLORS["stopping"],
+    "off": MUTED,
+}
 
 
 def system_prefers_dark():
@@ -138,16 +146,19 @@ class FarmGui:
         self._restart_job = None
         self._tray = None
         self._tray_hint_shown = False
+        self._adb_task = None
+        self._pair_win = None
+        self._device_poll_thread = None
+        self._device_name_cache = {}
+        self._log_groups = {}   # 日志合并：行文本 -> {"mark": 文本框标记名, "count": 次数}
+        self._log_seq = 0
 
         self.config = self._load_config()
-        if "dark_mode" in self.config:
-            self._dark = bool(self.config["dark_mode"])
-        else:
-            self._dark = system_prefers_dark()
+        self._appearance = self._initial_appearance()
+        ctk.set_appearance_mode(self._appearance)
         self._status_kind = "idle"
 
         self._build_ui()
-        self._apply_theme()
         self._init_window_icon()
         self._create_tray()
         self._resolve_adb()
@@ -155,103 +166,243 @@ class FarmGui:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_window)
         self.root.after(self.QUEUE_INTERVAL, self._drain_queue)
         self.root.after(300, self._refresh_stats)
+        self.root.after(800, self._poll_device_status)
 
         if self.config.get("start_minimized") and self._tray:
             self.root.after(200, self.hide_to_tray)
         if self.config.get("auto_start"):
             self.root.after(600, self.start_bot)
 
+    def _initial_appearance(self):
+        """新配置读 appearance；兼容旧配置的 dark_mode；都没有则跟随系统。"""
+        appearance = self.config.get("appearance")
+        if appearance in ("light", "dark", "system"):
+            return appearance
+        if "dark_mode" in self.config:
+            return "dark" if self.config["dark_mode"] else "light"
+        return "system"
+
     # ------------------------------------------------------------
     # 界面构建
     # ------------------------------------------------------------
     def _build_ui(self):
         self.root.title(APP_TITLE)
-        self.root.geometry("880x640")
-        self.root.minsize(720, 480)
-        pad = {"padx": 8, "pady": 4}
+        self.root.geometry("960x680")
+        self.root.minsize(880, 560)
+        pad = 14
+
+        yahei = "Microsoft YaHei UI"
+        self.font_title = ctk.CTkFont(family=yahei, size=17, weight="bold")
+        self.font_stat = ctk.CTkFont(family=yahei, size=20, weight="bold")
+        self.font_body = ctk.CTkFont(family=yahei, size=13)
+        self.font_small = ctk.CTkFont(family=yahei, size=12)
+        self.font_mono = ctk.CTkFont(family="Consolas", size=12)
 
         # 顶部：状态 + 操作按钮
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", **pad)
-        self.status_var = tk.StringVar(value="● 未运行")
-        self.status_label = ttk.Label(
-            top, textvariable=self.status_var,
-            font=("Microsoft YaHei UI", 12, "bold"),
+        header = ctk.CTkFrame(self.root, fg_color="transparent")
+        header.pack(fill="x", padx=pad, pady=(pad, 8))
+        self.status_var = tk.StringVar(value="●  未运行")
+        self.status_label = ctk.CTkLabel(
+            header, textvariable=self.status_var,
+            font=self.font_title, text_color=STATUS_COLORS["idle"],
         )
         self.status_label.pack(side="left")
+        # 设备名 + 连接状态，紧跟运行状态显示（此处横向空间充裕不会被挤裁）
+        self.device_status_var = tk.StringVar(value="●  检测设备中…")
+        self.device_status_label = ctk.CTkLabel(
+            header, textvariable=self.device_status_var,
+            font=self.font_small, text_color=MUTED, anchor="w",
+        )
+        self.device_status_label.pack(side="left", padx=(18, 0))
 
-        self.btn_stop = ttk.Button(top, text="停止挂机", command=self.stop_bot, state="disabled")
-        self.btn_stop.pack(side="right", padx=4)
-        self.btn_start = ttk.Button(top, text="启动挂机", command=self.start_bot)
-        self.btn_start.pack(side="right", padx=4)
-        ttk.Button(top, text="统计面板", command=self.open_stats_page).pack(side="right", padx=4)
-        ttk.Button(top, text="缩到托盘", command=self.hide_to_tray).pack(side="right", padx=4)
+        self.btn_start = ctk.CTkButton(
+            header, text="启动挂机", width=104, font=self.font_body,
+            command=self.start_bot, text_color_disabled=("gray45", "gray55"),
+        )
+        self.btn_start.pack(side="right", padx=(8, 0))
+        self._start_fg = self.btn_start.cget("fg_color")
+        self._start_hover = self.btn_start.cget("hover_color")
+        self.btn_stop = ctk.CTkButton(
+            header, text="停止挂机", width=104, font=self.font_body,
+            command=self.stop_bot, state="disabled",
+            fg_color=DISABLED_BTN, hover_color=STOP_HOVER,
+            text_color_disabled=("gray45", "gray55"),
+        )
+        self.btn_stop.pack(side="right", padx=(8, 0))
+        for text, cmd in (("缩到托盘", self.hide_to_tray), ("统计面板", self.open_stats_page)):
+            ctk.CTkButton(
+                header, text=text, width=92, font=self.font_body, command=cmd,
+                fg_color="transparent", border_width=1,
+                border_color=("gray60", "gray35"),
+                text_color=("gray20", "gray80"),
+                hover_color=("gray85", "gray25"),
+            ).pack(side="right", padx=(8, 0))
 
-        # 选项
-        opts = ttk.LabelFrame(self.root, text="选项")
-        opts.pack(fill="x", **pad)
-        ttk.Label(opts, text="手机亮度:").grid(row=0, column=0, sticky="w", padx=(8, 2), pady=6)
-        self.brightness_combo = ttk.Combobox(
-            opts, state="readonly", width=18,
-            values=[text for text, _ in BRIGHTNESS_OPTIONS],
+        # 统计卡片：轮数 / 收获 / 经验 / 下次启动
+        cards = ctk.CTkFrame(self.root, fg_color="transparent")
+        cards.pack(fill="x", padx=pad, pady=(0, 4))
+        for col in range(4):
+            cards.grid_columnconfigure(col, weight=1, uniform="stat")
+
+        self.rounds_var = tk.StringVar(value="0")
+        self.harvest_var = tk.StringVar(value="0")
+        self.exp_var = tk.StringVar(value="0")
+        self.wake_big_var = tk.StringVar(value="—")
+        self.wake_small_var = tk.StringVar(value="下次启动")
+
+        def _card(col, var, caption_text=None, caption_var=None, value_color=None):
+            frame = ctk.CTkFrame(cards, corner_radius=12)
+            frame.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 8, 0))
+            ctk.CTkLabel(
+                frame, textvariable=var, font=self.font_stat,
+                text_color=value_color, anchor="w",
+            ).pack(fill="x", padx=14, pady=(10, 0))
+            ctk.CTkLabel(
+                frame, text=caption_text, textvariable=caption_var,
+                font=self.font_small, text_color=MUTED, anchor="w",
+            ).pack(fill="x", padx=14, pady=(0, 10))
+            return frame
+
+        _card(0, self.rounds_var, caption_text="执行轮数")
+        _card(1, self.harvest_var, caption_text="成熟收获")
+        _card(2, self.exp_var, caption_text="累计经验")
+        _card(3, self.wake_big_var, caption_var=self.wake_small_var, value_color=ACCENT)
+
+        # 作物明细 + 更新时间
+        self.crops_var = tk.StringVar(value="")
+        ctk.CTkLabel(
+            self.root, textvariable=self.crops_var,
+            font=self.font_small, text_color=MUTED, anchor="w",
+        ).pack(fill="x", padx=pad + 4, pady=(0, 4))
+
+        # 选项行
+        opts = ctk.CTkFrame(self.root, corner_radius=12)
+        opts.pack(fill="x", padx=pad, pady=(0, 8))
+        ctk.CTkLabel(opts, text="手机亮度", font=self.font_body).pack(
+            side="left", padx=(14, 8), pady=10,
         )
         saved = self.config.get("brightness", "N")
-        index = next((i for i, (_, v) in enumerate(BRIGHTNESS_OPTIONS) if v == saved), 0)
-        self.brightness_combo.current(index)
-        self.brightness_combo.grid(row=0, column=1, sticky="w", pady=6)
-        self.brightness_combo.bind("<<ComboboxSelected>>", self._save_config)
+        saved_text = next(
+            (text for text, value in BRIGHTNESS_OPTIONS if value == saved),
+            BRIGHTNESS_OPTIONS[0][0],
+        )
+        self.brightness_var = tk.StringVar(value=saved_text)
+        self.brightness_menu = ctk.CTkOptionMenu(
+            opts, values=[text for text, _ in BRIGHTNESS_OPTIONS],
+            variable=self.brightness_var, width=170,
+            font=self.font_body, dropdown_font=self.font_body,
+            command=self._save_config,
+        )
+        self.brightness_menu.pack(side="left", pady=10)
 
         self.auto_start_var = tk.BooleanVar(value=bool(self.config.get("auto_start")))
         self.start_min_var = tk.BooleanVar(value=bool(self.config.get("start_minimized")))
         self.auto_restart_var = tk.BooleanVar(value=bool(self.config.get("auto_restart")))
-        ttk.Checkbutton(
-            opts, text="打开助手后自动开始挂机",
-            variable=self.auto_start_var, command=self._save_config,
-        ).grid(row=0, column=2, padx=(16, 4), pady=6)
-        ttk.Checkbutton(
-            opts, text="启动时直接进托盘",
-            variable=self.start_min_var, command=self._save_config,
-        ).grid(row=0, column=3, padx=4, pady=6)
-        ttk.Checkbutton(
-            opts, text="脚本异常退出自动重启",
-            variable=self.auto_restart_var, command=self._save_config,
-        ).grid(row=0, column=4, padx=4, pady=6)
-        self.dark_var = tk.BooleanVar(value=self._dark)
-        ttk.Checkbutton(
-            opts, text="深色模式",
-            variable=self.dark_var, command=self._on_toggle_theme,
-        ).grid(row=0, column=5, padx=4, pady=6)
+        for text, var in (
+            ("自动开始", self.auto_start_var),
+            ("启动进托盘", self.start_min_var),
+            ("异常自动重启", self.auto_restart_var),
+        ):
+            ctk.CTkSwitch(
+                opts, text=text, variable=var, onvalue=True, offvalue=False,
+                font=self.font_body, command=self._save_config,
+            ).pack(side="left", padx=(16, 0), pady=10)
 
-        # 统计
-        stats_frame = ttk.LabelFrame(self.root, text="统计")
-        stats_frame.pack(fill="x", **pad)
-        self.stats_var = tk.StringVar(value="暂无统计数据")
-        ttk.Label(
-            stats_frame, textvariable=self.stats_var, font=("Microsoft YaHei UI", 10),
-        ).pack(anchor="w", padx=8, pady=(4, 0))
-        self.wake_var = tk.StringVar(value="")
-        self.wake_label = ttk.Label(
-            stats_frame, textvariable=self.wake_var, font=("Microsoft YaHei UI", 10),
+        self.appearance_seg = ctk.CTkSegmentedButton(
+            opts, values=[text for text, _ in APPEARANCE_OPTIONS],
+            command=self._on_appearance, font=self.font_small,
         )
-        self.wake_label.pack(anchor="w", padx=8, pady=(0, 6))
+        self.appearance_seg.set(
+            next(text for text, value in APPEARANCE_OPTIONS if value == self._appearance)
+        )
+        self.appearance_seg.pack(side="right", padx=14, pady=10)
 
-        # 日志（tk.Text + ttk.Scrollbar：Windows 原生 tk 滚动条不吃深色配色）
-        log_frame = ttk.LabelFrame(self.root, text="运行日志")
-        log_frame.pack(fill="both", expand=True, **pad)
-        log_body = ttk.Frame(log_frame)
-        log_body.pack(fill="both", expand=True, padx=4, pady=4)
-        self.log_text = tk.Text(
-            log_body, state="disabled", wrap="word", font=("Consolas", 9),
-            relief="flat", borderwidth=0, highlightthickness=0,
+        # 设备行：无线地址 + 连接 / USB转无线 / 配对 + 锁屏密码 + 连接状态
+        conn = ctk.CTkFrame(self.root, corner_radius=12)
+        conn.pack(fill="x", padx=pad, pady=(0, 8))
+        ctk.CTkLabel(conn, text="无线ADB", font=self.font_body).pack(
+            side="left", padx=(14, 8), pady=10,
         )
-        log_scroll = ttk.Scrollbar(log_body, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        log_scroll.pack(side="right", fill="y")
-        self.log_text.pack(side="left", fill="both", expand=True)
+        self.device_entry = ctk.CTkEntry(
+            conn, width=190, font=self.font_body,
+            placeholder_text="IP:端口，留空自动选USB",
+        )
+        saved_device = str(self.config.get("wireless_device", "")).strip()
+        if saved_device:
+            self.device_entry.insert(0, saved_device)
+        self.device_entry.pack(side="left", pady=10)
+        self.device_entry.bind("<FocusOut>", self._save_config)
+        self.btn_wireless_connect = ctk.CTkButton(
+            conn, text="连接", width=64, font=self.font_body,
+            command=self.connect_wireless,
+        )
+        self.btn_wireless_connect.pack(side="left", padx=(8, 0), pady=10)
+        self.btn_usb_to_wifi = ctk.CTkButton(
+            conn, text="USB转无线", width=96, font=self.font_body,
+            command=self.usb_to_wireless,
+            fg_color="transparent", border_width=1,
+            border_color=("gray60", "gray35"),
+            text_color=("gray20", "gray80"),
+            hover_color=("gray85", "gray25"),
+        )
+        self.btn_usb_to_wifi.pack(side="left", padx=(8, 0), pady=10)
+        self.btn_pair = ctk.CTkButton(
+            conn, text="配对…", width=72, font=self.font_body,
+            command=self.open_pair_dialog,
+            fg_color="transparent", border_width=1,
+            border_color=("gray60", "gray35"),
+            text_color=("gray20", "gray80"),
+            hover_color=("gray85", "gray25"),
+        )
+        self.btn_pair.pack(side="left", padx=(8, 0), pady=10)
+        ctk.CTkLabel(conn, text="锁屏密码", font=self.font_body).pack(
+            side="left", padx=(16, 8), pady=10,
+        )
+        self.pwd_entry = ctk.CTkEntry(
+            conn, width=90, font=self.font_body, show="•",
+            placeholder_text="无密码留空",
+        )
+        saved_pwd = str(self.config.get("unlock_pwd", ""))
+        if saved_pwd:
+            self.pwd_entry.insert(0, saved_pwd)
+        self.pwd_entry.pack(side="left", pady=10)
+        self.pwd_entry.bind("<FocusOut>", self._save_config)
+        self.btn_pwd_eye = ctk.CTkButton(
+            conn, text="👁", width=30, font=self.font_body,
+            command=self._toggle_pwd_visible,
+            fg_color="transparent",
+            text_color=("gray20", "gray80"),
+            hover_color=("gray85", "gray25"),
+        )
+        self.btn_pwd_eye.pack(side="left", padx=(2, 0), pady=10)
+
+        # 日志（合并重复：同样内容的日志行只保留一行，行尾累加 ×N 计数）
+        log_bar = ctk.CTkFrame(self.root, fg_color="transparent")
+        log_bar.pack(fill="x", padx=pad + 4)
+        ctk.CTkLabel(
+            log_bar, text="运行日志", font=self.font_small,
+            text_color=MUTED, anchor="w",
+        ).pack(side="left")
+        self.collapse_var = tk.BooleanVar(
+            value=bool(self.config.get("log_collapse", True))
+        )
+        ctk.CTkSwitch(
+            log_bar, text="合并重复", variable=self.collapse_var,
+            onvalue=True, offvalue=False, font=self.font_small,
+            switch_height=16, switch_width=36,
+            command=self._on_collapse_toggle,
+        ).pack(side="right")
+        self.log_text = ctk.CTkTextbox(
+            self.root, corner_radius=12, font=self.font_mono,
+            wrap="word", state="disabled",
+        )
+        self.log_text.pack(fill="both", expand=True, padx=pad, pady=(2, pad))
 
     def _init_window_icon(self):
         try:
             from PIL import ImageTk
+            # 阻止 CTk 在 200ms 后覆盖为它自带的默认图标
+            self.root._iconbitmap_method_called = True
             self._icon_photo = ImageTk.PhotoImage(make_icon_image(True))
             self.root.iconphoto(True, self._icon_photo)
         except Exception:
@@ -271,6 +422,11 @@ class FarmGui:
             self._append_log(
                 f"[助手] ⚠️ WZRY_ADB 指向的文件不存在（{explicit}），尝试自动定位...\n"
             )
+        bundled = SCRIPT_DIR / "platform-tools" / "adb.exe"
+        if bundled.exists():
+            os.environ["WZRY_ADB"] = str(bundled)
+            self._append_log(f"[助手] 使用内置 adb: {bundled}\n")
+            return
         found = shutil.which("adb") or self._find_adb_in_registry_path()
         if found:
             os.environ["WZRY_ADB"] = found
@@ -309,6 +465,315 @@ class FarmGui:
                 except OSError:
                     continue
         return None
+
+    # ------------------------------------------------------------
+    # 无线 ADB
+    # ------------------------------------------------------------
+    @staticmethod
+    def _adb_run(*args, timeout=20):
+        """助手侧直接执行 adb（不弹黑框），用于连接/配对等主机命令。"""
+        adb = os.environ.get("WZRY_ADB") or "adb"
+        return subprocess.run(
+            [adb, *args], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
+    @staticmethod
+    def _normalize_wireless_addr(addr):
+        """无端口时补全 5555；adb 的 TCP 设备序列号总是带端口。"""
+        addr = addr.strip()
+        if addr and ":" not in addr:
+            addr = f"{addr}:5555"
+        return addr
+
+    @staticmethod
+    def _parse_wlan_ip(route_output):
+        """从 `ip route` 输出提取 WiFi 网卡的本机地址（优先 wlan 行的 src）。"""
+        fallback = None
+        for line in route_output.splitlines():
+            match = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", line)
+            if not match:
+                continue
+            if "wlan" in line:
+                return match.group(1)
+            fallback = fallback or match.group(1)
+        return fallback
+
+    def _start_adb_task(self, name, worker):
+        """后台线程执行无线 ADB 操作，避免卡住界面；同一时间只跑一个。"""
+        if self._adb_task is not None and self._adb_task.is_alive():
+            self._append_log("[无线ADB] 上一个操作还在进行中，请稍候\n")
+            return
+        def run():
+            try:
+                worker()
+            except subprocess.TimeoutExpired:
+                self.cmd_queue.put(
+                    ("log", f"[无线ADB] ❌ {name}超时，请确认手机与电脑在同一网络\n")
+                )
+            except Exception as exc:
+                self.cmd_queue.put(("log", f"[无线ADB] ❌ {name}失败: {exc}\n"))
+            finally:
+                self.cmd_queue.put(("adb_task_done", None))
+        self._adb_task = threading.Thread(target=run, daemon=True, name=f"adb-{name}")
+        self._adb_task.start()
+        self._refresh_adb_controls()
+
+    def _refresh_adb_controls(self):
+        busy = self._adb_task is not None and self._adb_task.is_alive()
+        state = "disabled" if busy else "normal"
+        self.btn_wireless_connect.configure(state=state)
+        self.btn_pair.configure(state=state)
+        # tcpip 会重启手机 adbd，挂机运行中切换会打断正在执行的命令
+        self.btn_usb_to_wifi.configure(
+            state="disabled" if (busy or self._running) else "normal"
+        )
+        entry_state = "disabled" if self._running else "normal"
+        self.device_entry.configure(state=entry_state)
+        self.pwd_entry.configure(state=entry_state)
+
+    def _entry_text(self, entry_attr, config_key):
+        """读输入框文本；退出流程中控件可能已销毁，回退到已保存配置。"""
+        try:
+            return getattr(self, entry_attr).get().strip()
+        except (AttributeError, tk.TclError):
+            return str(self.config.get(config_key, "")).strip()
+
+    def _toggle_pwd_visible(self):
+        """切换锁屏密码的明文/圆点显示。"""
+        hidden = self.pwd_entry.cget("show") == "•"
+        self.pwd_entry.configure(show="" if hidden else "•")
+        self.btn_pwd_eye.configure(text="🙈" if hidden else "👁")
+
+    def _set_device_entry(self, addr):
+        """连接成功后回填设备地址并保存配置（兼容运行中被禁用的输入框）。"""
+        entry = self.device_entry
+        state = entry.cget("state")
+        entry.configure(state="normal")
+        entry.delete(0, "end")
+        entry.insert(0, addr)
+        entry.configure(state=state)
+        self._save_config()
+
+    # ------------------------------------------------------------
+    # 设备状态显示
+    # ------------------------------------------------------------
+    DEVICE_POLL_INTERVAL = 5000  # 设备状态刷新 (ms)
+
+    def _poll_device_status(self):
+        """定时在后台线程刷新设备名与连接状态（adb devices 只查主机端，很轻）。"""
+        if self._quitting:
+            return
+        if self._device_poll_thread is None or not self._device_poll_thread.is_alive():
+            preferred = self._normalize_wireless_addr(
+                self._entry_text("device_entry", "wireless_device")
+            )
+            def worker():
+                self.cmd_queue.put(
+                    ("device_status", self._query_device_status(preferred))
+                )
+            self._device_poll_thread = threading.Thread(
+                target=worker, daemon=True, name="device-poll",
+            )
+            self._device_poll_thread.start()
+        self.root.after(self.DEVICE_POLL_INTERVAL, self._poll_device_status)
+
+    @staticmethod
+    def _parse_adb_devices(output):
+        """解析 `adb devices` 输出为 [(serial, state), ...]，保持顺序。"""
+        rows = []
+        for line in output.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) >= 2:
+                rows.append((fields[0], fields[1]))
+        return rows
+
+    @staticmethod
+    def _choose_device(rows, preferred):
+        """选出面板显示的设备：填了地址就看它；否则优先 USB，再看其余。"""
+        if preferred:
+            for serial, state in rows:
+                if serial == preferred:
+                    return serial, state
+            return preferred, None
+        for serial, state in rows:
+            if ":" not in serial:
+                return serial, state
+        return rows[0] if rows else (None, None)
+
+    def _query_device_status(self, preferred):
+        """后台线程：返回 (状态文本, 颜色类别 ok/warn/off)。"""
+        try:
+            result = self._adb_run("devices", timeout=10)
+        except Exception:
+            return "●  ADB 不可用", "off"
+        serial, state = self._choose_device(
+            self._parse_adb_devices(result.stdout), preferred
+        )
+        if serial is None:
+            return "●  未发现设备", "off"
+        if state is None:
+            return "●  未连接", "off"
+        if state == "device":
+            return f"●  {self._device_name(serial)} · 已连接", "ok"
+        if state == "unauthorized":
+            return "●  未授权，手机上点允许", "warn"
+        if state == "offline":
+            return "●  设备离线", "warn"
+        return f"●  {state}", "warn"
+
+    def _device_name(self, serial):
+        """读取设备名（市场名优先，其次型号），按序列号缓存避免反复查询。"""
+        cached = self._device_name_cache.get(serial)
+        if cached:
+            return cached
+        try:
+            result = self._adb_run(
+                "-s", serial, "shell",
+                "getprop ro.product.marketname; getprop ro.product.model",
+                timeout=8,
+            )
+            lines = [line.strip() for line in result.stdout.splitlines()]
+            name = next((line for line in lines if line), "") or serial
+        except Exception:
+            return serial
+        if len(name) > 18:
+            name = name[:17] + "…"
+        self._device_name_cache[serial] = name
+        return name
+
+    def connect_wireless(self):
+        addr = self._normalize_wireless_addr(self.device_entry.get())
+        if not addr:
+            self._append_log(
+                "[无线ADB] 请先填写设备地址（手机 开发者选项 → 无线调试 页面显示的 IP:端口）\n"
+            )
+            return
+        def worker():
+            self.cmd_queue.put(("log", f"[无线ADB] 正在连接 {addr} ...\n"))
+            result = self._adb_run("connect", addr)
+            out = (result.stdout + result.stderr).strip()
+            if "connected to" not in out:
+                self.cmd_queue.put(("log", f"[无线ADB] ❌ 连接失败: {out or '无输出'}\n"))
+                return
+            # connect 成功不代表已授权，用 get-state 再确认一次
+            state = self._adb_run("-s", addr, "get-state")
+            if state.returncode == 0 and state.stdout.strip() == "device":
+                self.cmd_queue.put(("log", f"[无线ADB] ✅ 已连接: {addr}\n"))
+                self.cmd_queue.put(("wireless_ok", addr))
+            else:
+                err = (state.stdout + state.stderr).strip()
+                hint = "，请在手机上允许调试授权弹窗" if "unauthorized" in err else ""
+                self.cmd_queue.put(("log", f"[无线ADB] ⚠️ 已连接但设备不可用: {err}{hint}\n"))
+        self._start_adb_task("连接", worker)
+
+    def usb_to_wireless(self):
+        """USB 连接的手机一键切换为无线：tcpip 5555 → 取 WiFi 地址 → connect。"""
+        def worker():
+            devices = self._adb_run("devices")
+            usb = []
+            for line in devices.stdout.splitlines()[1:]:
+                fields = line.split()
+                if len(fields) >= 2 and fields[1] == "device" and ":" not in fields[0]:
+                    usb.append(fields[0])
+            if not usb:
+                self.cmd_queue.put(
+                    ("log", "[无线ADB] ❌ 未检测到USB设备，请先用数据线连接手机并允许USB调试\n")
+                )
+                return
+            if len(usb) > 1:
+                self.cmd_queue.put(
+                    ("log", f"[无线ADB] ❌ 检测到多台USB设备（{', '.join(usb)}），请只保留一台再试\n")
+                )
+                return
+            serial = usb[0]
+            route = self._adb_run("-s", serial, "shell", "ip", "route")
+            ip = self._parse_wlan_ip(route.stdout)
+            if not ip:
+                inet = self._adb_run(
+                    "-s", serial, "shell", "ip", "-f", "inet", "addr", "show", "wlan0",
+                )
+                match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", inet.stdout)
+                ip = match.group(1) if match else None
+            if not ip:
+                self.cmd_queue.put(
+                    ("log", "[无线ADB] ❌ 未能获取手机 WiFi 地址，请确认手机已连接 WiFi\n")
+                )
+                return
+            self.cmd_queue.put(("log", f"[无线ADB] 手机地址 {ip}，正在切换TCP模式...\n"))
+            tcpip = self._adb_run("-s", serial, "tcpip", "5555")
+            if "restarting" not in (tcpip.stdout + tcpip.stderr):
+                out = (tcpip.stdout + tcpip.stderr).strip()
+                self.cmd_queue.put(("log", f"[无线ADB] ❌ 切换TCP模式失败: {out or '无输出'}\n"))
+                return
+            time.sleep(2)  # 等手机 adbd 以 TCP 模式重启完成
+            addr = f"{ip}:5555"
+            result = self._adb_run("connect", addr)
+            out = (result.stdout + result.stderr).strip()
+            if "connected to" in out:
+                self.cmd_queue.put(
+                    ("log", f"[无线ADB] ✅ 已切换到无线连接 {addr}，"
+                            "现在可以拔掉USB线（手机重启后需重新切换）\n")
+                )
+                self.cmd_queue.put(("wireless_ok", addr))
+            else:
+                self.cmd_queue.put(("log", f"[无线ADB] ❌ 无线连接失败: {out or '无输出'}\n"))
+        self._start_adb_task("USB转无线", worker)
+
+    def open_pair_dialog(self):
+        """Android 11+ 无线调试配对，全程无需数据线。"""
+        if self._pair_win is not None and self._pair_win.winfo_exists():
+            self._pair_win.lift()
+            self._pair_win.focus_force()
+            return
+        win = ctk.CTkToplevel(self.root)
+        self._pair_win = win
+        win.title("无线调试配对")
+        win.resizable(False, False)
+        win.transient(self.root)
+        ctk.CTkLabel(
+            win, justify="left", anchor="w", font=self.font_small,
+            text=(
+                "手机上打开 开发者选项 → 无线调试 → 使用配对码配对设备，\n"
+                "将弹窗中的 IP:端口 与六位配对码填到下面。\n"
+                "配对成功后，把无线调试主页面显示的 IP:端口（与配对端口不同）\n"
+                "填入主界面的设备地址，点「连接」即可。"
+            ),
+        ).pack(fill="x", padx=16, pady=(14, 8))
+        entries = {}
+        for key, label, placeholder in (
+            ("addr", "配对地址", "如 192.168.1.100:37123"),
+            ("code", "配对码", "6位数字"),
+        ):
+            row = ctk.CTkFrame(win, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=4)
+            ctk.CTkLabel(row, text=label, width=64, anchor="w", font=self.font_body).pack(side="left")
+            entry = ctk.CTkEntry(row, font=self.font_body, placeholder_text=placeholder)
+            entry.pack(side="left", fill="x", expand=True)
+            entries[key] = entry
+        def submit():
+            addr = entries["addr"].get().strip()
+            code = entries["code"].get().strip()
+            if not addr or not code:
+                return
+            win.destroy()
+            def worker():
+                self.cmd_queue.put(("log", f"[无线ADB] 正在配对 {addr} ...\n"))
+                result = self._adb_run("pair", addr, code, timeout=30)
+                out = (result.stdout + result.stderr).strip()
+                if "Successfully paired" in out:
+                    self.cmd_queue.put(
+                        ("log", "[无线ADB] ✅ 配对成功。请在设备地址填入 无线调试 主页面"
+                                "显示的 IP:端口 并点击「连接」\n")
+                    )
+                else:
+                    self.cmd_queue.put(("log", f"[无线ADB] ❌ 配对失败: {out or '无输出'}\n"))
+            self._start_adb_task("配对", worker)
+        ctk.CTkButton(win, text="开始配对", width=120, font=self.font_body, command=submit).pack(
+            pady=(10, 14),
+        )
+        win.after(120, win.focus_force)
 
     # ------------------------------------------------------------
     # 系统托盘
@@ -393,22 +858,37 @@ class FarmGui:
         if self._quitting or (self.proc and self.proc.poll() is None):
             return
         self._cancel_restart()
-        if not MAIN_SCRIPT.exists():
-            messagebox.showerror(APP_TITLE, f"找不到脚本: {MAIN_SCRIPT}")
-            return
+        if IS_FROZEN:
+            if not CORE_EXE.exists():
+                messagebox.showerror(APP_TITLE, f"找不到挂机核心: {CORE_EXE}")
+                return
+            cmd = [str(CORE_EXE)]
+        else:
+            if not MAIN_SCRIPT.exists():
+                messagebox.showerror(APP_TITLE, f"找不到脚本: {MAIN_SCRIPT}")
+                return
+            cmd = [self._child_python(), "-u", str(MAIN_SCRIPT)]
         self._save_config()
 
-        brightness = BRIGHTNESS_OPTIONS[self.brightness_combo.current()][1]
+        brightness = dict(BRIGHTNESS_OPTIONS).get(self.brightness_var.get(), "N")
         env = {
             **os.environ,
             "PYTHONIOENCODING": "utf-8",
             "WZRY_GUI": "1",
             "WZRY_BRIGHTNESS": brightness,
         }
+        wireless = self._normalize_wireless_addr(self.device_entry.get())
+        if wireless:
+            # 挂机核心据此定位设备，掉线时也会用它自动 adb connect 重连
+            env["WZRY_DEVICE"] = wireless
+        unlock_pwd = self.pwd_entry.get().strip()
+        if unlock_pwd:
+            # 唤醒屏幕后上滑并输入该密码解锁（无密码留空则只上滑）
+            env["WZRY_UNLOCK_PWD"] = unlock_pwd
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             self.proc = subprocess.Popen(
-                [self._child_python(), "-u", str(MAIN_SCRIPT)],
+                cmd,
                 cwd=str(SCRIPT_DIR),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -474,8 +954,8 @@ class FarmGui:
             return
         self._cancel_restart()
         self.user_stop = True
-        self._set_status("stopping", "● 正在停止...")
-        self.btn_stop.state(["disabled"])
+        self._set_status("stopping", "●  正在停止...")
+        self.btn_stop.configure(state="disabled", fg_color=DISABLED_BTN)
         self._append_log("[助手] 正在停止挂机（脚本会退出游戏并恢复手机亮度）...\n")
         self._send_stop(proc)
         threading.Thread(
@@ -526,7 +1006,7 @@ class FarmGui:
                 return
         self._quitting = True
         self._cancel_restart()
-        self._set_status("stopping", "● 正在退出...")
+        self._set_status("stopping", "●  正在退出...")
         proc = self.proc
         if proc and proc.poll() is None:
             self._send_stop(proc)
@@ -577,6 +1057,16 @@ class FarmGui:
                     self.open_stats_page()
                 elif kind == "quit":
                     self.quit_app()
+                elif kind == "adb_task_done":
+                    self._refresh_adb_controls()
+                elif kind == "wireless_ok":
+                    self._set_device_entry(payload)
+                elif kind == "device_status":
+                    text, level = payload
+                    self.device_status_var.set(text)
+                    self.device_status_label.configure(
+                        text_color=DEVICE_STATUS_COLORS.get(level, MUTED)
+                    )
         except queue.Empty:
             pass
         if not self._quitting:
@@ -586,13 +1076,77 @@ class FarmGui:
         widget = self.log_text
         at_bottom = widget.yview()[1] >= 0.99
         widget.configure(state="normal")
-        widget.insert("end", text)
-        line_count = int(widget.index("end-1c").split(".")[0])
-        if line_count > self.MAX_LOG_LINES + 200:
-            widget.delete("1.0", f"{line_count - self.MAX_LOG_LINES}.0")
+        if not self._try_collapse_line(widget, text):
+            self._insert_log_line(widget, text)
+            line_count = int(widget.index("end-1c").split(".")[0])
+            if line_count > self.MAX_LOG_LINES + 200:
+                widget.delete("1.0", f"{line_count - self.MAX_LOG_LINES}.0")
         widget.configure(state="disabled")
         if at_bottom:
             widget.see("end")
+
+    def _try_collapse_line(self, widget, text):
+        """Unity 控制台风格合并：重复日志行不追加，在原行累加 ×N。
+
+        每个已见过的行在文本框里用 mark 记住位置；顶部裁剪或错位后
+        mark 所在行内容对不上，则放弃该组、按新行重新追加（自愈）。
+        """
+        if not self.collapse_var.get() or not text.endswith("\n"):
+            return False
+        key = text[:-1]
+        if not key.strip() or "\n" in key:
+            return False  # 空行与多行块不参与合并
+        group = self._log_groups.get(key)
+        if group is None:
+            return False
+        line = widget.index(group["mark"]).split(".")[0]
+        shown = widget.get(f"{line}.0", f"{line}.0 lineend")
+        expected = key if group["count"] == 1 else f"{key}  ×{group['count']}"
+        if shown != expected:
+            widget.mark_unset(group["mark"])
+            del self._log_groups[key]
+            return False
+        group["count"] += 1
+        widget.delete(f"{line}.0", f"{line}.0 lineend")
+        widget.insert(f"{line}.0", f"{key}  ×{group['count']}")
+        return True
+
+    def _insert_log_line(self, widget, text):
+        """追加日志；合并开启时为单行内容登记 mark，供后续重复行累加。"""
+        collapsible = (
+            self.collapse_var.get()
+            and text.endswith("\n")
+            and "\n" not in text[:-1]
+            and text.strip()
+            # 上一块以换行结尾（新块从行首开始）才能按整行登记
+            and widget.index("end-1c") == widget.index("end-1c linestart")
+        )
+        if not collapsible:
+            widget.insert("end", text)
+            return
+        if len(self._log_groups) > 2000:  # 防字典无限增长，整体重置
+            self._reset_log_groups(widget)
+        start_line = widget.index("end-1c").split(".")[0]
+        widget.insert("end", text)
+        self._log_seq += 1
+        mark = f"loggrp{self._log_seq}"
+        widget.mark_set(mark, f"{start_line}.0")
+        widget.mark_gravity(mark, "left")
+        self._log_groups[text[:-1]] = {"mark": mark, "count": 1}
+
+    def _reset_log_groups(self, widget=None):
+        widget = widget or self.log_text
+        for group in self._log_groups.values():
+            try:
+                widget.mark_unset(group["mark"])
+            except tk.TclError:
+                pass
+        self._log_groups = {}
+
+    def _on_collapse_toggle(self):
+        # 开关切换后旧分组作废：关闭时停止合并，重新打开时从当前位置重新统计
+        self._reset_log_groups()
+        self._save_config()
 
     def _refresh_stats(self):
         data = None
@@ -603,29 +1157,35 @@ class FarmGui:
         if data:
             totals = data.get("totals", {})
             crops = totals.get("crops") or {}
-            parts = [
-                f"轮数 {totals.get('rounds', 0)}",
-                f"收获 {totals.get('harvests', 0)} 次",
-                f"经验 +{totals.get('exp', 0)}",
-            ]
-            crops_text = "  ".join(f"{k}×{v}" for k, v in list(crops.items())[:6])
-            if crops_text:
-                parts.append(crops_text)
-            parts.append(f"更新于 {data.get('updated', '-')}")
-            self.stats_var.set("    ".join(parts))
-            self.wake_var.set(self._format_wake(data.get("next_wake") or {}))
+            self.rounds_var.set(str(totals.get("rounds", 0)))
+            self.harvest_var.set(str(totals.get("harvests", 0)))
+            self.exp_var.set(f"+{totals.get('exp', 0)}")
+            crops_text = "   ".join(f"{k} ×{v}" for k, v in list(crops.items())[:8])
+            updated = data.get("updated", "-")
+            self.crops_var.set(
+                f"作物  {crops_text}    更新于 {updated}" if crops_text
+                else f"更新于 {updated}"
+            )
+            big, small = self._format_wake(data.get("next_wake") or {})
+            self.wake_big_var.set(big)
+            self.wake_small_var.set(small)
         if not self._quitting:
             self.root.after(self.STATS_INTERVAL, self._refresh_stats)
 
-    def _format_wake(self, wake):
+    @staticmethod
+    def _format_wake(wake):
+        """返回 (大字倒计时, 小字说明)。"""
         when = wake.get("wake")
         if not when:
-            return ""
+            return "—", "下次启动"
         reason = wake.get("reason") or ""
         try:
             dt = datetime.strptime(when, "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            return f"下次启动: {when} {reason}"
+            return when, f"下次启动 {reason}".strip()
+        detail = f"下次启动 {dt.strftime('%m-%d %H:%M:%S')}"
+        if reason:
+            detail += f" · {reason}"
         remain = (dt - datetime.now()).total_seconds()
         if remain > 0:
             hours, rem = divmod(int(remain), 3600)
@@ -636,18 +1196,23 @@ class FarmGui:
                 countdown = f"{minutes}分{seconds:02d}秒"
             else:
                 countdown = f"{seconds}秒"
-            return f"下次启动: {dt.strftime('%m-%d %H:%M:%S')}（{reason}）  还剩 {countdown}"
-        return f"上次计划: {dt.strftime('%m-%d %H:%M:%S')}（{reason}）"
+            return countdown, detail
+        return "已到点", detail.replace("下次启动", "上次计划")
 
     def _set_running(self, running):
         self._running = running
         if running:
-            self._set_status("running", "● 挂机运行中")
+            self._set_status("running", "●  挂机运行中")
+            self.btn_start.configure(state="disabled", fg_color=DISABLED_BTN)
+            self.btn_stop.configure(state="normal", fg_color=STOP_FG)
         else:
-            self._set_status("idle", "● 未运行")
-        self.btn_start.state(["disabled"] if running else ["!disabled"])
-        self.btn_stop.state(["!disabled"] if running else ["disabled"])
-        self.brightness_combo.configure(state="disabled" if running else "readonly")
+            self._set_status("idle", "●  未运行")
+            self.btn_start.configure(
+                state="normal", fg_color=self._start_fg, hover_color=self._start_hover,
+            )
+            self.btn_stop.configure(state="disabled", fg_color=DISABLED_BTN)
+        self.brightness_menu.configure(state="disabled" if running else "normal")
+        self._refresh_adb_controls()
         if self._tray:
             try:
                 self._tray.icon = make_icon_image(running)
@@ -656,128 +1221,17 @@ class FarmGui:
                 pass
 
     # ------------------------------------------------------------
-    # 主题
+    # 外观与状态
     # ------------------------------------------------------------
-    def _theme(self):
-        return THEMES["dark" if self._dark else "light"]
-
     def _set_status(self, kind, text):
         self._status_kind = kind
         self.status_var.set(text)
-        self.status_label.configure(foreground=self._theme()[STATUS_COLOR_KEY[kind]])
+        self.status_label.configure(text_color=STATUS_COLORS[kind])
 
-    def _on_toggle_theme(self):
-        self._dark = bool(self.dark_var.get())
-        self._apply_theme()
+    def _on_appearance(self, choice_text):
+        self._appearance = dict(APPEARANCE_OPTIONS).get(choice_text, "system")
+        ctk.set_appearance_mode(self._appearance)
         self._save_config()
-
-    def _apply_theme(self):
-        t = self._theme()
-        style = ttk.Style(self.root)
-        # Windows 原生主题（vista）不响应配色，clam 全部颜色可配置
-        style.theme_use("clam")
-
-        style.configure(
-            ".", background=t["bg"], foreground=t["fg"],
-            fieldbackground=t["entry_bg"], troughcolor=t["bg"],
-            bordercolor=t["border"], lightcolor=t["bg"], darkcolor=t["bg"],
-            focuscolor=t["muted"], selectbackground=t["select_bg"],
-            selectforeground=t["fg"],
-        )
-        style.configure("TFrame", background=t["bg"])
-        style.configure("TLabel", background=t["bg"], foreground=t["fg"])
-        style.configure(
-            "TLabelframe", background=t["bg"], bordercolor=t["border"],
-            lightcolor=t["bg"], darkcolor=t["bg"],
-        )
-        style.configure("TLabelframe.Label", background=t["bg"], foreground=t["muted"])
-        style.configure(
-            "TButton", background=t["button_bg"], foreground=t["fg"],
-            bordercolor=t["border"], lightcolor=t["button_bg"],
-            darkcolor=t["button_bg"], focuscolor=t["muted"], padding=(10, 4),
-        )
-        style.map(
-            "TButton",
-            background=[("disabled", t["bg"]), ("pressed", t["button_active"]),
-                        ("active", t["button_active"])],
-            foreground=[("disabled", t["muted"])],
-        )
-        style.configure(
-            "TCheckbutton", background=t["bg"], foreground=t["fg"],
-            indicatorbackground=t["entry_bg"], indicatorforeground=t["fg"],
-            focuscolor=t["bg"],
-        )
-        style.map(
-            "TCheckbutton",
-            background=[("active", t["bg"])],
-            indicatorbackground=[("pressed", t["button_active"]),
-                                 ("selected", t["entry_bg"])],
-        )
-        style.configure(
-            "TCombobox", fieldbackground=t["entry_bg"], background=t["button_bg"],
-            foreground=t["fg"], arrowcolor=t["fg"], bordercolor=t["border"],
-            lightcolor=t["entry_bg"], darkcolor=t["entry_bg"],
-        )
-        style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", t["entry_bg"]), ("disabled", t["bg"])],
-            foreground=[("disabled", t["muted"])],
-            selectbackground=[("readonly", t["entry_bg"])],
-            selectforeground=[("readonly", t["fg"])],
-            arrowcolor=[("disabled", t["muted"])],
-        )
-        style.configure(
-            "Vertical.TScrollbar", background=t["button_bg"], troughcolor=t["bg"],
-            bordercolor=t["bg"], arrowcolor=t["fg"],
-            lightcolor=t["button_bg"], darkcolor=t["button_bg"],
-        )
-        style.map("Vertical.TScrollbar", background=[("active", t["button_active"])])
-
-        self.root.configure(bg=t["bg"])
-        self.log_text.configure(
-            bg=t["text_bg"], fg=t["text_fg"], insertbackground=t["fg"],
-            selectbackground=t["select_bg"], selectforeground=t["text_fg"],
-        )
-        self.wake_label.configure(foreground=t["accent"])
-        self.status_label.configure(foreground=t[STATUS_COLOR_KEY[self._status_kind]])
-
-        # 下拉列表是 tk Listbox：option_add 影响未来创建，已创建的直接改
-        self.root.option_add("*TCombobox*Listbox.background", t["entry_bg"])
-        self.root.option_add("*TCombobox*Listbox.foreground", t["fg"])
-        self.root.option_add("*TCombobox*Listbox.selectBackground", t["select_bg"])
-        self.root.option_add("*TCombobox*Listbox.selectForeground", t["fg"])
-        try:
-            popdown = self.root.tk.call(
-                "ttk::combobox::PopdownWindow", self.brightness_combo,
-            )
-            self.root.tk.call(
-                f"{popdown}.f.l", "configure",
-                "-background", t["entry_bg"], "-foreground", t["fg"],
-                "-selectbackground", t["select_bg"], "-selectforeground", t["fg"],
-            )
-        except tk.TclError:
-            pass
-
-        self._apply_titlebar()
-
-    def _apply_titlebar(self):
-        """Windows 10/11：让标题栏跟随深浅色。失败无妨，只影响外观。"""
-        if os.name != "nt":
-            return
-        try:
-            import ctypes
-            self.root.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            value = ctypes.c_int(1 if self._dark else 0)
-            for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE（旧系统编号 19）
-                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value),
-                ) == 0:
-                    break
-            # SWP_NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED：立即重绘标题栏
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0037)
-        except Exception:
-            pass
 
     # ------------------------------------------------------------
     # 其他
@@ -829,11 +1283,14 @@ class FarmGui:
 
     def _save_config(self, *_event):
         cfg = {
-            "brightness": BRIGHTNESS_OPTIONS[self.brightness_combo.current()][1],
+            "brightness": dict(BRIGHTNESS_OPTIONS).get(self.brightness_var.get(), "N"),
             "auto_start": bool(self.auto_start_var.get()),
             "start_minimized": bool(self.start_min_var.get()),
             "auto_restart": bool(self.auto_restart_var.get()),
-            "dark_mode": bool(self.dark_var.get()),
+            "appearance": self._appearance,
+            "wireless_device": self._entry_text("device_entry", "wireless_device"),
+            "unlock_pwd": self._entry_text("pwd_entry", "unlock_pwd"),
+            "log_collapse": bool(self.collapse_var.get()),
         }
         self.config = cfg
         try:
@@ -859,15 +1316,9 @@ def acquire_single_instance():
 
 
 def main():
-    # 高分屏下让窗口文字清晰
-    try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-
     lock = acquire_single_instance()
-    root = tk.Tk()
+    ctk.set_default_color_theme("green")
+    root = ctk.CTk()
     if lock is None:
         root.withdraw()
         messagebox.showinfo(APP_TITLE, "助手已在运行（请查看系统托盘区图标）")

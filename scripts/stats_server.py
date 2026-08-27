@@ -7,11 +7,16 @@
 也可独立运行：python scripts/stats_server.py --file assets/stats.json --port 8765
 """
 
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-PAGE_FILE = Path(__file__).resolve().parent.parent / "stats.html"
+# 打包（PyInstaller）后本模块被冻结进 exe，stats.html 与 exe 同级
+if getattr(sys, "frozen", False):
+    PAGE_FILE = Path(sys.executable).resolve().parent / "stats.html"
+else:
+    PAGE_FILE = Path(__file__).resolve().parent.parent / "stats.html"
 
 
 class StatsHandler(BaseHTTPRequestHandler):

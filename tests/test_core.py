@@ -36,12 +36,23 @@ class TemplateMatchingTests(unittest.TestCase):
         self.assertGreaterEqual(x1, 0.75)
 
     def test_dedicated_template_scales_are_bounded(self):
-        scales = wzry_auto._template_scales(
-            ROOT / "assets" / "templates" / "2400x1080",
-            2400,
-            1080,
-        )
+        # 精确匹配的分辨率目录：预测比例为 1，尺度限制在 ±10%
+        scales = wzry_auto._template_scales(2400, 1080, (2400, 1080))
         self.assertEqual(scales, [0.9, 0.95, 1.0, 1.05, 1.1])
+
+    def test_cross_resolution_scales_follow_height_ratio(self):
+        # 跨分辨率目录：按截图高度/模板源高度预缩放（2510x1156 ← 2400x1080）
+        scales = wzry_auto._template_scales(2510, 1156, (2400, 1080))
+        predicted = 1156 / 1080
+        self.assertIn(round(predicted, 3), scales)
+        self.assertEqual(len(scales), 5)
+        self.assertLess(max(scales), predicted * 1.2)
+        self.assertGreater(min(scales), predicted * 0.8)
+
+    def test_template_dirs_prefer_exact_then_nearest_height(self):
+        dirs = [d.name for d, _ in wzry_auto._template_dirs(2510, 1156)]
+        self.assertEqual(dirs[0], "2400x1080")  # 高度 1080 比 1440 更接近 1156
+        self.assertEqual(dirs[-1], "templates")  # 默认目录兜底
 
 
 class AdbTests(unittest.TestCase):
@@ -61,6 +72,112 @@ class AdbTests(unittest.TestCase):
             ["-s", "example:5555", "get-state"],
         )
         self.assertNotIn("shell", kwargs)
+
+
+class WirelessReconnectTests(unittest.TestCase):
+    @staticmethod
+    def _completed(returncode=0, stdout=""):
+        return subprocess.CompletedProcess([], returncode, stdout, "")
+
+    @patch("wzry_auto.time.sleep")
+    @patch("wzry_auto.subprocess.run")
+    def test_wireless_device_reconnects_after_drop(self, run, _sleep):
+        run.side_effect = [
+            self._completed(1),                                       # get-state 掉线
+            self._completed(0),                                       # disconnect
+            self._completed(0, "connected to 192.168.1.10:5555\n"),   # connect
+            self._completed(0, "device\n"),                           # get-state 确认
+        ]
+        previous = wzry_auto.DEVICE
+        try:
+            wzry_auto.DEVICE = "192.168.1.10:5555"
+            self.assertTrue(
+                wzry_auto.ensure_device_connected(max_attempts=2, retry_interval=0)
+            )
+        finally:
+            wzry_auto.DEVICE = previous
+        self.assertEqual(run.call_count, 4)
+        connect_args = run.call_args_list[2][0][0]
+        self.assertEqual(connect_args[-2:], ["connect", "192.168.1.10:5555"])
+
+    @patch("wzry_auto.time.sleep")
+    @patch("wzry_auto.subprocess.run")
+    def test_usb_device_offline_fails_without_connect(self, run, _sleep):
+        run.return_value = self._completed(1)
+        previous = wzry_auto.DEVICE
+        try:
+            wzry_auto.DEVICE = "USB1234"
+            self.assertFalse(wzry_auto.ensure_device_connected(max_attempts=3))
+        finally:
+            wzry_auto.DEVICE = previous
+        self.assertEqual(run.call_count, 1)  # 只查了一次状态，USB 设备不该尝试 connect
+
+
+class WirelessGuiHelperTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import wzry_gui
+        except Exception as exc:  # 无 GUI 依赖的环境跳过
+            raise unittest.SkipTest(f"GUI 依赖不可用: {exc}")
+        cls.FarmGui = wzry_gui.FarmGui
+
+    def test_normalize_appends_default_port(self):
+        self.assertEqual(
+            self.FarmGui._normalize_wireless_addr("192.168.1.5"), "192.168.1.5:5555"
+        )
+        self.assertEqual(
+            self.FarmGui._normalize_wireless_addr(" 192.168.1.5:40001 "),
+            "192.168.1.5:40001",
+        )
+        self.assertEqual(self.FarmGui._normalize_wireless_addr(""), "")
+
+    def test_parse_wlan_ip_prefers_wlan_interface(self):
+        route = (
+            "10.0.0.0/24 dev rmnet0 proto kernel scope link src 10.0.0.5\n"
+            "192.168.1.0/24 dev wlan0 proto kernel scope link src 192.168.1.100\n"
+        )
+        self.assertEqual(self.FarmGui._parse_wlan_ip(route), "192.168.1.100")
+
+    def test_parse_wlan_ip_falls_back_to_any_src(self):
+        route = "172.16.0.0/16 dev eth0 proto kernel scope link src 172.16.0.9\n"
+        self.assertEqual(self.FarmGui._parse_wlan_ip(route), "172.16.0.9")
+
+    def test_parse_adb_devices_skips_header_and_blank_lines(self):
+        output = (
+            "List of devices attached\n"
+            "USB1234\tdevice\n"
+            "192.168.1.10:5555\toffline\n"
+            "\n"
+        )
+        self.assertEqual(
+            self.FarmGui._parse_adb_devices(output),
+            [("USB1234", "device"), ("192.168.1.10:5555", "offline")],
+        )
+
+    def test_choose_device_prefers_filled_address(self):
+        rows = [("USB1234", "device"), ("192.168.1.10:5555", "device")]
+        self.assertEqual(
+            self.FarmGui._choose_device(rows, "192.168.1.10:5555"),
+            ("192.168.1.10:5555", "device"),
+        )
+        # 填了地址但不在线：状态为 None 表示未连接
+        self.assertEqual(
+            self.FarmGui._choose_device([], "192.168.1.10:5555"),
+            ("192.168.1.10:5555", None),
+        )
+
+    def test_choose_device_auto_prefers_usb(self):
+        rows = [("192.168.1.10:5555", "device"), ("USB1234", "device")]
+        self.assertEqual(
+            self.FarmGui._choose_device(rows, ""), ("USB1234", "device")
+        )
+        # 只有无线设备时展示无线设备；空列表返回 (None, None)
+        self.assertEqual(
+            self.FarmGui._choose_device([("192.168.1.10:5555", "device")], ""),
+            ("192.168.1.10:5555", "device"),
+        )
+        self.assertEqual(self.FarmGui._choose_device([], ""), (None, None))
 
 
 class HarvestParsingTests(unittest.TestCase):
@@ -94,6 +211,51 @@ class MaturityParsingTests(unittest.TestCase):
 
     def test_absolute_time_not_matched(self):
         self.assertIsNone(wzry_auto.parse_relative_maturity("18:25成熟"))
+
+    @staticmethod
+    def _read_maturity_with(ocr_text, fake_now):
+        """用假 OCR 结果与固定当前时间驱动 read_maturity_time。"""
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls.fromtimestamp(fake_now.timestamp(), tz)
+
+        fake_engine = lambda roi: ([[None, ocr_text, 0.9]], 0.1)
+        img = np.zeros((900, 2400, 3), dtype=np.uint8)
+        with patch.object(wzry_auto, "datetime", _FixedDatetime), \
+             patch.object(wzry_auto, "get_ocr", return_value=fake_engine), \
+             patch.object(wzry_auto, "cv_imread", return_value=img):
+            return wzry_auto.read_maturity_time("fake.png")
+
+    def test_cross_day_relative_maturity_keeps_date(self):
+        # 回归：29小时19分钟（1759分钟）跨天，此前丢日期导致 32 小时作物被判成 8 小时
+        fake_now = datetime(2026, 8, 26, 13, 7, 0)
+        maturity_dt, is_mature = self._read_maturity_with("29小时19分钟后成熟", fake_now)
+        self.assertFalse(is_mature)
+        self.assertEqual(maturity_dt, fake_now + timedelta(minutes=1759))
+
+    def test_absolute_time_past_midnight_rolls_to_next_day(self):
+        fake_now = datetime(2026, 8, 26, 23, 50, 0)
+        maturity_dt, _ = self._read_maturity_with("00：02成熟", fake_now)
+        self.assertEqual(maturity_dt, datetime(2026, 8, 27, 0, 2, 0))
+
+    def test_absolute_time_with_tomorrow_prefix(self):
+        # "明天14:00" 晚于当前时刻也必须按次日处理
+        fake_now = datetime(2026, 8, 26, 13, 0, 0)
+        maturity_dt, _ = self._read_maturity_with("明天14:00成熟", fake_now)
+        self.assertEqual(maturity_dt, datetime(2026, 8, 27, 14, 0, 0))
+
+    def test_cross_day_remaining_matches_32h_crop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cycle_file = Path(directory) / "crop_cycle.json"
+            with patch.object(wzry_auto, "CYCLE_FILE", str(cycle_file)):
+                first_water = datetime(2026, 8, 26, 13, 7, 0)
+                result = wzry_auto.calculate_plant_cycle_and_water_time(
+                    first_water, first_water + timedelta(minutes=1759),
+                    save_if_fresh=True,
+                )
+        self.assertEqual(result["plant_cycle_min"], 1920)
 
     def test_stale_stored_cycle_is_ignored(self):
         with tempfile.TemporaryDirectory() as directory:

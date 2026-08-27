@@ -18,6 +18,12 @@ assets/no_oneclick.png
 assets/maturity_*.png
 diagnostics/
 
+# 打包产物
+dist/
+packaging/build/
+packaging/buildvenv/
+packaging/app.ico
+
 # IDE
 .vscode/
 .idea/
