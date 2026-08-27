@@ -178,6 +178,40 @@ venv\Scripts\python packaging\build_release.py
 把 zip 发给对方，解压后双击 `农场助手.exe` 即可。接收方只需要一台
 Windows 10/11 64 位电脑和开了 USB 调试的安卓手机（或雷电模拟器）。
 
+### 在线更新（改完代码不用再挨个发压缩包）
+
+完整 zip 只在第一次给新用户；之后每次改动用一条命令发布，老用户的助手会
+自动发现新版本，点一下就完成增量下载、文件替换和重启：
+
+```cmd
+venv\Scripts\python packaging\build_release.py --publish
+```
+
+原理与产物：
+
+- 构建后按文件 sha256 生成 `manifest.json`，并打两个分包：
+  `app_版本.zip`（两个 exe + 模板 + 页面，约 10MB，每次发布都上传）、
+  `runtime_版本.zip`（`_internal` + `platform-tools`，约 80MB，
+  仅依赖变化导致内容变动时才重新上传，平时直接复用旧版本的附件）
+- 发布即在 Gitee 仓库创建一个 Release（tag 如 `v20260827-1`），
+  把 manifest 和分包传为附件；客户端匿名走 Gitee API 检查最新版
+- 客户端逐文件对比哈希，只下载覆盖差异的分包、只解压需要的文件，
+  校验通过后热替换（运行中的 exe 先改名挪进 `_update\trash`，重启后清理），
+  任一步失败自动回滚，不会出现半新半旧
+- 版本状态记录在 `packaging\release_state.json`（建议随代码提交，
+  换机器构建也能接着发布）；`--publish-dir \\nas\wzry` 可发布到局域网
+  共享目录，接收方在 `assets\gui_config.json` 写 `"update_url"` 指向它即可
+
+一次性准备：Gitee 头像 → 设置 → 安全设置 → 私人令牌，生成一个勾选
+`projects` 的 token，设为环境变量 `GITEE_TOKEN`（或写入
+`packaging\gitee_token.txt`，该文件已被 gitignore，绝不会入库）。
+
+客户端行为：启动 8 秒后与每 6 小时静默检查一次（可在 `gui_config.json`
+里 `"auto_update_check": false` 关闭）；发现新版本时弹窗展示更新说明，
+「立即更新」会先优雅停止挂机再更新重启。把 `"auto_update": true` 写进
+配置则发现即自动更新（适合长期无人值守的挂机机器）。更新说明缺省取
+上次发布以来的 `git log`，也可用 `--notes "文字"` 指定。
+
 打包版说明：
 
 - 两个 exe 与 `_internal/` 运行库同级，模板在包内 `assets\templates\` 下可直接替换；

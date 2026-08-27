@@ -24,6 +24,9 @@ packaging/build/
 packaging/buildvenv/
 packaging/app.ico
 
+# 发布凭据（私人令牌，绝不入库）
+packaging/gitee_token.txt
+
 # IDE
 .vscode/
 .idea/
