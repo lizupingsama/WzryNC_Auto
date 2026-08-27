@@ -325,28 +325,28 @@ class MaturityParsingTests(unittest.TestCase):
         self.assertEqual(maturity_dt, datetime(2026, 8, 27, 14, 0, 0))
 
     def test_cross_day_remaining_matches_32h_tier(self):
-        # 剩余1759分钟（29小时19分）→ 32小时档，节点23h12（1392分钟）
+        # 剩余1759分钟（29小时19分）→ 32小时档，节点1280（播种后10h40那次）
         now = datetime(2026, 8, 26, 13, 7, 0)
         result = wzry_auto.calculate_next_water_time(
             now + timedelta(minutes=1759), now=now
         )
         self.assertEqual(result["tier_min"], 1920)
-        self.assertEqual(result["node_min"], 1392)
-        self.assertEqual(result["next_water"], now + timedelta(minutes=1759 - 1392))
+        self.assertEqual(result["node_min"], 1280)
+        self.assertEqual(result["next_water"], now + timedelta(minutes=1759 - 1280))
 
     def test_short_remaining_uses_tier_node_not_rebase(self):
-        # 回归：剩余50分钟 → 1小时档节点44 → 6分钟后浇水，
+        # 回归：剩余50分钟 → 1小时档节点40（播种后20分钟那次）→ 10分钟后浇水，
         # 而不是以当前时刻为基准按周期比例重排
         now = datetime(2026, 8, 26, 10, 0, 0)
         result = wzry_auto.calculate_next_water_time(
             now + timedelta(minutes=50), now=now
         )
         self.assertEqual(result["tier_min"], 60)
-        self.assertEqual(result["node_min"], 44)
-        self.assertEqual(result["next_water"], now + timedelta(minutes=6))
+        self.assertEqual(result["node_min"], 40)
+        self.assertEqual(result["next_water"], now + timedelta(minutes=10))
 
     def test_mid_remaining_matches_8h_tier(self):
-        # 剩余300分钟（5小时）→ 8小时档，节点2h40（160分钟）
+        # 剩余300分钟（5小时）→ 8小时档，节点160（播种后5h20那次）
         now = datetime(2026, 8, 25, 10, 0, 0)
         result = wzry_auto.calculate_next_water_time(
             now + timedelta(minutes=300), now=now
@@ -355,7 +355,7 @@ class MaturityParsingTests(unittest.TestCase):
         self.assertEqual(result["next_water"], now + timedelta(minutes=300 - 160))
 
     def test_past_last_node_waits_for_mature(self):
-        # 剩余15分钟已低于1小时档最后节点20，不再浇水，等成熟收获
+        # 剩余15分钟已低于1小时档最后节点16，不再浇水，等成熟收获
         now = datetime(2026, 8, 26, 10, 0, 0)
         result = wzry_auto.calculate_next_water_time(
             now + timedelta(minutes=15), now=now
