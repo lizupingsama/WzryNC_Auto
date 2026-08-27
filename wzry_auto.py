@@ -89,6 +89,8 @@ TEMPLATE_ROIS = {
     "close_popup_event.png": (0.70, 0.03, 0.96, 0.30),
     # 协议弹窗只框「同意」按钮（左边界 0.48 把 0.49 屏宽处的「拒绝」排除在外）
     "agree_terms.png": (0.48, 0.62, 0.82, 0.92),
+    # 新版 UI 通用左上角返回箭头（活动页/农场页同款同位）
+    "back_arrow.png": (0.04, 0.00, 0.19, 0.12),
     "lainongchang.png": (0.00, 0.55, 0.55, 1.00),
     "refresh_pos.png": (0.75, 0.70, 1.00, 1.00),
     "oneclick_farm.png": (0.45, 0.35, 0.80, 0.80),
@@ -100,6 +102,8 @@ TEMPLATE_THRESHOLDS = {
     "close_popup.png": 0.90,
     "close_popup_event.png": 0.78,
     "agree_terms.png": 0.85,
+    # 白色箭头字形主导得分，换背景实测仍有 0.917（农场页），噪声上限 0.573
+    "back_arrow.png": 0.80,
     "lainongchang.png": 0.75,
     "refresh_pos.png": 0.60,
     "oneclick_farm.png": 0.75,
@@ -1176,11 +1180,22 @@ def step3_click_start_game():
         
         if click_template("start_game.png", SCREENSHOT_PATH, label="开始游戏"):
             print("  ⏳ 等待大厅...")
-            if wait_for_any_template(
-                ["close_popup.png", "close_popup_event.png", "lainongchang.png"],
-                timeout=90, interval=3, label="大厅",
-            ):
-                return True
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                screenshot(SCREENSHOT_PATH)
+                if find_any_template(
+                    ["close_popup.png", "close_popup_event.png", "lainongchang.png"],
+                    SCREENSHOT_PATH,
+                ):
+                    print("  ✅ 大厅已就绪")
+                    return True
+                # 登录后可能盖全屏活动页（如回归福利，无 ✕ 只有返回），点返回退出
+                if click_template("back_arrow.png", SCREENSHOT_PATH, label="退出活动页"):
+                    time.sleep(3)
+                    continue
+                remaining = max(0, int(deadline - time.monotonic()))
+                print(f"  ⏳ 等待大厅，剩余 {remaining}秒")
+                time.sleep(3)
             save_diagnostic("step3_lobby_timeout")
             return False
 

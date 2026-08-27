@@ -78,6 +78,41 @@ class TemplateMatchingTests(unittest.TestCase):
         x1, _, _, _ = wzry_auto.TEMPLATE_ROIS["agree_terms.png"]
         self.assertGreaterEqual(x1, 0.45)
 
+    def test_back_arrow_matches_at_real_position(self):
+        # 登录后可能盖全屏活动页（如回归福利），无 ✕ 只有左上角返回箭头；
+        # 模板取自 3200x1440 实机截图，箭头中心位于 (307,76)
+        template = wzry_auto.cv_imread(
+            ROOT / "assets" / "templates" / "3200x1440" / "back_arrow.png"
+        )
+        th, tw = template.shape[:2]
+        canvas = np.zeros((1440, 3200, 3), dtype=np.uint8)
+        canvas[40:40 + th, 236:236 + tw] = template
+        with tempfile.TemporaryDirectory() as directory:
+            screenshot = Path(directory) / "activity.png"
+            wzry_auto.cv_imwrite(screenshot, canvas)
+            result = wzry_auto.find_template("back_arrow.png", str(screenshot))
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            (result["x"], result["y"]), (236 + tw // 2, 40 + th // 2)
+        )
+
+    def test_back_arrow_generalizes_across_backgrounds(self):
+        # 新版 UI 各页面共用同款返回箭头：农场页参考截图背景不同，
+        # 也必须达标，证明活动页背景变化不影响识别
+        result = wzry_auto.find_template(
+            "back_arrow.png",
+            str(ROOT / "assets" / "screenshots" / "3200x1440_farm_statue.png"),
+        )
+        self.assertIsNotNone(result)
+
+    def test_back_arrow_absent_on_login_page(self):
+        # 登录页没有返回箭头，不得误报（步骤3等待大厅时会点它）
+        result = wzry_auto.find_template(
+            "back_arrow.png",
+            str(ROOT / "assets" / "screenshots" / "3200x1440_login.png"),
+        )
+        self.assertIsNone(result)
+
     def test_dedicated_template_scales_are_bounded(self):
         # 精确匹配的分辨率目录：预测比例为 1，尺度限制在 ±10%
         scales = wzry_auto._template_scales(2400, 1080, (2400, 1080))
