@@ -12,10 +12,12 @@ import subprocess
 import time
 import math
 import os
+import random
 import signal
 import socket
 import sys
 import shutil
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -258,6 +260,33 @@ signal.signal(signal.SIGTERM, signal_handler)
 if hasattr(signal, "SIGBREAK"):
     # Windows 下收到 CTRL_BREAK / 控制台关闭时也走统一清理流程
     signal.signal(signal.SIGBREAK, signal_handler)
+
+# “立刻务农”指令（GUI 经 stdin 发送）：只在轮次间等待时接受。
+# _idle_wait 标记“当前正处于等待期”，务农步骤执行中收到的指令直接驳回。
+_farm_now = threading.Event()
+_idle_wait = threading.Event()
+
+def wait_or_farm_now(seconds):
+    """轮次之间的等待，可被“立刻务农”指令打断；返回 True 表示被打断。
+
+    等待期间置位 _idle_wait，stdin 监听线程据此决定接受还是驳回指令。
+    用分段 time.sleep 轮询而不是 Event.wait 整段等待：Windows 下锁等待
+    不会被 SIGINT 唤醒，保住 time.sleep 才能让“停止挂机”继续即时生效。
+    """
+    end = time.monotonic() + seconds
+    _idle_wait.set()
+    try:
+        while True:
+            if _farm_now.is_set():
+                _farm_now.clear()
+                print("  ⚡ 立刻务农：跳过等待，马上开始新一轮")
+                return True
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(1.0, remaining))
+    finally:
+        _idle_wait.clear()
 
 # ============================================================
 # 浇水时间计算
@@ -694,6 +723,33 @@ def tap(x, y, label=""):
 def swipe(x1, y1, x2, y2, duration_ms=1000):
     """滑动"""
     adb_input(f"input swipe {x1} {y1} {x2} {y2} {duration_ms}")
+
+def random_screen_fiddle():
+    """退出游戏前在屏幕上随手乱划乱点几下，打散“收完立刻退出”的固定
+    行为特征（防风控）。只在一轮务农成功完成后调用：此时还在农场场景、
+    马上就要退出游戏，误触界面没有副作用。
+
+    坐标限制在屏幕中部（横向 30%~70%、纵向 30%~65%），避开左下摇杆
+    与四周的功能按钮；次数、位置、滑动时长、间隔全部随机。
+    """
+    try:
+        w, h = detect_resolution()
+        x_lo, x_hi = int(w * 0.30), int(w * 0.70)
+        y_lo, y_hi = int(h * 0.30), int(h * 0.65)
+        actions = random.randint(3, 6)
+        print(f"  🖐️ 退出前随机滑动/点击 {actions} 次，模拟真人操作...")
+        for _ in range(actions):
+            x = random.randint(x_lo, x_hi)
+            y = random.randint(y_lo, y_hi)
+            if random.random() < 0.5:
+                tap(x, y)
+            else:
+                swipe(x, y, random.randint(x_lo, x_hi), random.randint(y_lo, y_hi),
+                      random.randint(200, 800))
+            time.sleep(random.uniform(0.4, 1.2))
+    except Exception as exc:
+        # 尽力而为：随机操作失败不影响本轮结果与后续退出流程
+        print(f"  ⚠️ 随机操作失败（忽略）: {exc}")
 
 # ============================================================
 # 模板匹配
@@ -1413,13 +1469,15 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
     # 作物已成熟可收获，直接重启收割；识别失败则走下方5分钟重试分支
     if is_mature:
         print("  🌾 作物已成熟，退出游戏重新进入收割...")
+        random_screen_fiddle()
         adb_shell(f"am force-stop {GAME_PKG}")
         _reapply_low_brightness()
         stats.set_next_wake(datetime.now(), None, "作物已成熟，立即收割")
         time.sleep(3)
         return None
     
-    # 先杀掉游戏
+    # 先随机划拉几下再杀掉游戏
+    random_screen_fiddle()
     print("  🛑 退出王者荣耀...")
     adb_shell(f"am force-stop {GAME_PKG}")
     _reapply_low_brightness()
@@ -1656,6 +1714,9 @@ def main():
     
     round_num = stats.rounds  # 接续历史轮次编号
     while True:
+        # 作废竞态窗口（等待刚结束、新一轮将启）漏进来的立刻务农指令，
+        # 否则它会原样打断下一次等待、多跑一轮
+        _farm_now.clear()
         round_num += 1
         stats.begin_round(round_num)
         print(f"\n{'='*60}")
@@ -1672,7 +1733,7 @@ def main():
                 while True:
                     retry_at = datetime.now() + timedelta(seconds=30)
                     stats.set_next_wake(retry_at, retry_at, "设备离线，等待重连")
-                    time.sleep(30)
+                    wait_or_farm_now(30)
                     if ensure_device_connected(max_attempts=1):
                         print("  ✅ 设备恢复连接，继续挂机")
                         break
@@ -1690,7 +1751,7 @@ def main():
                 stats.finish_round("失败：游戏启动页超时")
                 save_diagnostic("step2_launch")
                 force_stop_game()
-                time.sleep(30)
+                wait_or_farm_now(30)
                 continue
 
             # 步骤2b: 关闭启动弹窗
@@ -1726,7 +1787,7 @@ def main():
                 print("\n❌ 步骤7连续失败，本轮结束")
                 stats.finish_round("失败：未找到一键务农")
                 force_stop_game()
-                time.sleep(30)
+                wait_or_farm_now(30)
                 continue
         
             # 步骤8: 关闭收获弹窗
@@ -1752,7 +1813,7 @@ def main():
                     print("  🌙 等待较长，熄灭手机屏幕")
                     adb_input("input keyevent KEYCODE_SLEEP")
                 print(f"\n⏳ 等待到 {wake_time.strftime('%m-%d %H:%M:%S')} 唤醒...")
-                time.sleep(wait_seconds)
+                wait_or_farm_now(wait_seconds)
             # 醒屏和解锁在下一轮循环开头统一处理
         except subprocess.TimeoutExpired as exc:
             # 设备偶发无响应（USB抖动、无线掉线、高负载卡顿）不应终止挂机，
@@ -1761,10 +1822,12 @@ def main():
             stats.finish_round("失败：ADB命令超时")
             ensure_device_connected(max_attempts=3, retry_interval=10)
             force_stop_game()
-            time.sleep(30)
+            wait_or_farm_now(30)
 
 def _start_gui_stop_watcher():
-    """GUI 模式（WZRY_GUI=1）：监听 stdin，收到 stop 或管道断开时优雅退出。
+    """GUI 模式（WZRY_GUI=1）：监听 stdin。收到 stop 或管道断开时优雅退出；
+    收到 farm_now 且正处于轮次间等待时置位 _farm_now 马上开始新一轮，
+    务农步骤执行中则驳回（避免把指令攒到本轮结束后多跑一轮）。
 
     图形助手（wzry_gui.py）以管道接管本进程 stdin。即使助手被强制结束，
     管道 EOF 也会触发这里的退出流程，避免留下无人管理的挂机进程。
@@ -1774,13 +1837,19 @@ def _start_gui_stop_watcher():
     """
     if os.environ.get("WZRY_GUI") != "1":
         return
-    import threading
 
     def watch():
         try:
             for line in sys.stdin:
-                if line.strip().lower() == "stop":
+                cmd = line.strip().lower()
+                if cmd == "stop":
                     break
+                if cmd == "farm_now":
+                    if _idle_wait.is_set():
+                        print("\n⚡ 收到立刻务农指令，马上开始新一轮")
+                        _farm_now.set()
+                    else:
+                        print("\n⚠️ 正在执行务农流程，立刻务农已驳回（等待下一轮期间才可用）")
         except (OSError, ValueError):
             pass
         print("\n⚠️ 收到助手停止指令（或助手已关闭），正在退出...")
