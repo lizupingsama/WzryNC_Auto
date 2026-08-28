@@ -826,7 +826,7 @@ def find_any_template(template_names, screenshot_path, thresholds=None):
             best = result
     return best
 
-def wait_for_any_template(template_names, timeout=60, interval=3, label="页面"):
+def wait_for_any_template(template_names, timeout=60, interval=1, label="页面"):
     """轮询等待任一目标出现；成功后返回匹配结果。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -880,8 +880,8 @@ def reset_position():
     """刷新站位重置角色位置"""
     print("  🔄 刷新站位...")
     if click_template("refresh_pos.png", SCREENSHOT_PATH, label="刷新站位"):
-        print("  ⏳ 等待5秒...")
-        time.sleep(5)
+        print("  ⏳ 等待3秒...")
+        time.sleep(3)
         return True
     return False
 
@@ -1114,8 +1114,8 @@ def step1_check_status():
     if in_foreground:
         print("  🎮 王者荣耀在前台，退出...")
         adb_shell(f"am force-stop {GAME_PKG}")
-        print("  ⏳ 等待5秒...")
-        time.sleep(5)
+        print("  ⏳ 等待2秒...")
+        time.sleep(2)
         return True
     else:
         print(f"  ✅ 王者荣耀不在前台")
@@ -1132,7 +1132,7 @@ def step2_launch_game():
     return wait_for_any_template(
         ["start_game.png", "close_popup.png", "close_popup_event.png",
          "agree_terms.png"],
-        timeout=60, interval=3, label="游戏启动页",
+        timeout=60, interval=1, label="游戏启动页",
     ) is not None
 
 
@@ -1156,8 +1156,8 @@ def step2b_close_startup_popups():
             action = "同意协议" if result["template"] == "agree_terms.png" else "关闭启动弹窗"
             tap(x, y, f"{action}/{result['template']}")
             miss_count = 0
-            print("  ⏳ 等待5秒...")
-            time.sleep(5)
+            print("  ⏳ 等待2秒...")
+            time.sleep(2)
         else:
             if find_template("start_game.png", SCREENSHOT_PATH):
                 print("  ✅ 已到登录页，无需继续处理启动弹窗")
@@ -1197,23 +1197,23 @@ def step3_click_start_game():
                     return True
                 # 登录后可能盖全屏活动页（如回归福利，无 ✕ 只有返回），点返回退出
                 if click_template("back_arrow.png", SCREENSHOT_PATH, label="退出活动页"):
-                    time.sleep(3)
+                    time.sleep(2)
                     continue
                 remaining = max(0, int(deadline - time.monotonic()))
                 print(f"  ⏳ 等待大厅，剩余 {remaining}秒")
-                time.sleep(3)
+                time.sleep(1)
             save_diagnostic("step3_lobby_timeout")
             return False
 
         # 协议条款更新后首启弹「拒绝/同意」确认框（无 ✕），点掉后登录页才出现
         if click_template("agree_terms.png", SCREENSHOT_PATH, label="同意协议"):
-            print("  ⏳ 已同意协议，等待5秒...")
-            time.sleep(5)
+            print("  ⏳ 已同意协议，等待2秒...")
+            time.sleep(2)
             continue
 
         if attempt < 4:
-            print("  ⏳ 等待5秒...")
-            time.sleep(5)
+            print("  ⏳ 等待2秒...")
+            time.sleep(2)
     
     print("  ❌ 连续5次失败，返回步骤1")
     save_diagnostic("step3_start_game")
@@ -1237,8 +1237,8 @@ def step4_close_popup():
             x, y = result["x"], result["y"]
             tap(x, y, f"关闭弹窗/{result['template']}")
             miss_count = 0
-            print("  ⏳ 等待5秒...")
-            time.sleep(5)
+            print("  ⏳ 等待2秒...")
+            time.sleep(2)
         else:
             if find_template("lainongchang.png", SCREENSHOT_PATH):
                 print("  ✅ 已进入大厅主页，弹窗处理完毕")
@@ -1266,14 +1266,14 @@ def step5_enter_farm():
         if click_template("lainongchang.png", SCREENSHOT_PATH, label="进入农场"):
             print("  ⏳ 等待农场加载...")
             if wait_for_any_template(
-                ["refresh_pos.png"], timeout=60, interval=3, label="农场"
+                ["refresh_pos.png"], timeout=60, interval=1, label="农场"
             ):
                 return True
             save_diagnostic("step5_farm_timeout")
             return False
 
-        print(f"  ⏳ 等待5秒... ({attempt+1}/10)")
-        time.sleep(5)
+        print(f"  ⏳ 等待2秒... ({attempt+1}/10)")
+        time.sleep(2)
 
     print("  ❌ 连续10次未找到进入农场按钮")
     save_diagnostic("step5_enter_farm")
@@ -1297,7 +1297,7 @@ def step6_move_to_statue():
     cfg = _step6_cfg
     move_joystick(cfg["angle"], cfg["distance"], cfg["duration"], center=cfg["center"])
     print(f"  ⏳ 等待移动...")
-    time.sleep(5)
+    time.sleep(2)
     return True
 
 # ============================================================
@@ -1311,15 +1311,15 @@ def step7_oneclick_farm():
     
     if has_template("oneclick_farm.png", SCREENSHOT_PATH):
         print("  ✅ 找到一键务农按钮")
-        print("  ⏳ 等待3秒...")
-        time.sleep(3)
-        
+        print("  ⏳ 等待1秒...")
+        time.sleep(1)
+
         if not click_template("oneclick_farm.png", SCREENSHOT_PATH, label="一键务农"):
             return False, None
         farm_time = datetime.now()
         print(f"  🕐 一键务农时间: {farm_time.strftime('%H:%M:%S')}")
-        print("  ⏳ 等待5秒...")
-        time.sleep(5)
+        print("  ⏳ 等待2秒...")
+        time.sleep(2)
         return True, farm_time
     else:
         print("  ❌ 未找到一键务农，返回步骤6")
@@ -1356,16 +1356,17 @@ def step8_close_harvest():
             else:
                 stats.add_harvest()
             
-            print("  ⏳ 等待3秒...")
-            time.sleep(3)
-            
+            print("  ⏳ 等待1秒...")
+            time.sleep(1)
+
             click_template("harvest_continue.png", SCREENSHOT_PATH, label="继续")
-            print("  ⏳ 等待5秒...")
-            time.sleep(5)
+            print("  ⏳ 等待2秒...")
+            time.sleep(2)
             return True, harvested
         else:
-            print(f"  ⚠️ 未找到收获弹窗，等待3秒后重试 ({attempt+1}/2)")
-            time.sleep(3)
+            if attempt == 0:
+                print("  ⚠️ 未找到收获弹窗，等待2秒后重试 (1/2)")
+                time.sleep(2)
 
     print("  ⚠️ 连续2次未找到收获弹窗，进入步骤9")
     return False, False
@@ -1383,11 +1384,18 @@ def step9_move_to_farmland():
     # 向上方移动
     move_joystick(90, 200, 1200)  # 90度是正上方
     print("  ⏳ 等待移动...")
-    time.sleep(5)
+    time.sleep(2)
 
-    # 截图OCR
-    screenshot(SCREENSHOT_PATH)
-    maturity_dt, is_mature = read_maturity_time(SCREENSHOT_PATH)
+    # 截图OCR；识别失败原地快速重试，避免直接落入步骤10的5分钟重试惩罚
+    maturity_dt, is_mature = None, False
+    for attempt in range(3):
+        screenshot(SCREENSHOT_PATH)
+        maturity_dt, is_mature = read_maturity_time(SCREENSHOT_PATH)
+        if maturity_dt or is_mature:
+            break
+        if attempt < 2:
+            print(f"  ⚠️ 未识别到成熟时间，2秒后重试 ({attempt + 1}/3)")
+            time.sleep(2)
 
     # 如果作物已成熟（可收获），不需要等待
     if is_mature:
@@ -1421,7 +1429,7 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
         adb_shell(f"am force-stop {GAME_PKG}")
         _reapply_low_brightness()
         stats.set_next_wake(datetime.now(), None, "作物已成熟，立即收割")
-        time.sleep(3)
+        time.sleep(1)
         return None
     
     # 先随机划拉几下再杀掉游戏
