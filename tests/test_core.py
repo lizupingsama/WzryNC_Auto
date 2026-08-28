@@ -54,6 +54,89 @@ class TemplateMatchingTests(unittest.TestCase):
             (result["x"], result["y"]), (2458 + tw // 2, 161 + th // 2)
         )
 
+    def test_kpl_popup_close_matches_at_real_position(self):
+        # KPL 观赛直播弹窗（比赛期间每次登录必弹）关闭钮是右上角海星样式 ✕，
+        # 模板取自 3200x1440 失败现场，中心位于 (2807,157)
+        result = wzry_auto.find_template(
+            "close_popup_kpl.png",
+            str(ROOT / "assets" / "screenshots" / "3200x1440_kpl_live_popup.png"),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual((result["x"], result["y"]), (2807, 157))
+
+    def test_kpl_popup_close_absent_elsewhere(self):
+        # 全部参考截图噪声上限 0.544（event_popup），阈值 0.80 不得误报
+        for name in ("3200x1440_event_popup.png", "3200x1440_login.png"):
+            result = wzry_auto.find_template(
+                "close_popup_kpl.png",
+                str(ROOT / "assets" / "screenshots" / name),
+            )
+            self.assertIsNone(result, name)
+
+    def test_dialog_confirm_matches_on_rest_reminder(self):
+        # 健康系统「呵护双眼」休息提醒只有 确定/帮助/前往营地 三键、无 ✕；
+        # 模板取自 3200x1440 失败现场，「确定」中心位于 (1595,928)
+        result = wzry_auto.find_template(
+            "dialog_confirm.png",
+            str(ROOT / "assets" / "screenshots" / "3200x1440_rest_reminder_popup.png"),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual((result["x"], result["y"]), (1595, 928))
+
+    def test_dialog_confirm_roi_excludes_sibling_buttons(self):
+        # 「帮助」从 0.553 屏宽起、「前往营地」更靠右；搜索区右界必须
+        # 卡在 0.56 以内，让同排按钮连完整匹配窗口都放不进去
+        _, _, x2, _ = wzry_auto.TEMPLATE_ROIS["dialog_confirm.png"]
+        self.assertLessEqual(x2, 0.56)
+
+    def test_dialog_confirm_absent_on_agree_popup(self):
+        # 协议弹窗的「同意」也是同款蓝色按钮，但位置在 ROI 之外，不得误报
+        # （误点「同意」无害，但说明 ROI 失守）
+        result = wzry_auto.find_template(
+            "dialog_confirm.png",
+            str(ROOT / "assets" / "screenshots" / "3200x1440_agree_terms_popup.png"),
+        )
+        self.assertIsNone(result)
+
+    def test_new_popup_templates_reusable_across_resolutions(self):
+        # 新模板只存于 3200x1440 目录，其余设备靠高度比例预缩放复用。
+        # 按「UI 随屏高等比缩放、宽度只是两侧留边」模拟现役另两档分辨率，
+        # 实测 KPL✕ 0.987/0.994、确定钮 0.987/0.975，均远超阈值
+        cases = [
+            ("close_popup_kpl.png", "3200x1440_kpl_live_popup.png", (2807, 157)),
+            ("dialog_confirm.png", "3200x1440_rest_reminder_popup.png", (1595, 928)),
+        ]
+        for width, height in ((2510, 1156), (2400, 1080)):
+            scale = height / 1440
+            for template, shot, (src_x, src_y) in cases:
+                img = wzry_auto.cv_imread(
+                    ROOT / "assets" / "screenshots" / shot
+                )
+                import cv2
+                scaled = cv2.resize(
+                    img, (round(img.shape[1] * scale), height),
+                    interpolation=cv2.INTER_AREA,
+                )
+                crop_x = (scaled.shape[1] - width) // 2
+                sim = scaled[:, crop_x:crop_x + width]
+                with tempfile.TemporaryDirectory() as directory:
+                    screenshot = Path(directory) / "sim.png"
+                    wzry_auto.cv_imwrite(screenshot, sim)
+                    result = wzry_auto.find_template(template, str(screenshot))
+                label = f"{template} @ {width}x{height}"
+                self.assertIsNotNone(result, label)
+                self.assertAlmostEqual(
+                    result["x"], src_x * scale - crop_x, delta=4, msg=label
+                )
+                self.assertAlmostEqual(
+                    result["y"], src_y * scale, delta=4, msg=label
+                )
+
+    def test_lobby_popup_closers_cover_new_popups(self):
+        # 步骤3/4/5 共用的弹窗关闭清单必须包含两类新弹窗
+        self.assertIn("close_popup_kpl.png", wzry_auto.LOBBY_POPUP_CLOSERS)
+        self.assertIn("dialog_confirm.png", wzry_auto.LOBBY_POPUP_CLOSERS)
+
     def test_agree_terms_matches_at_real_position(self):
         # 协议条款更新弹窗只有「拒绝/同意」两键、无 ✕；模板取自 3200x1440
         # 实机截图，「同意」按钮中心位于 (1851,1089)

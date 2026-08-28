@@ -89,6 +89,11 @@ TEMPLATE_ROIS = {
     # 模板主体会伸到 0.78 左侧，框到 0.78 会把它裁掉导致匹配不到。
     "close_popup.png": (0.70, 0.03, 0.96, 0.30),
     "close_popup_event.png": (0.70, 0.03, 0.96, 0.30),
+    # KPL 观赛直播弹窗右上角的海星样式 ✕（实测 3200x1440 中心 (2807,157)）
+    "close_popup_kpl.png": (0.70, 0.03, 0.96, 0.30),
+    # 通用对话框居中「确定」（如健康系统休息提醒）。右界 0.56 保证同排的
+    # 「帮助/前往营地」连完整匹配窗口都放不进搜索区，永远不会被误点
+    "dialog_confirm.png": (0.44, 0.58, 0.56, 0.72),
     # 协议弹窗只框「同意」按钮（左边界 0.48 把 0.49 屏宽处的「拒绝」排除在外）
     "agree_terms.png": (0.48, 0.62, 0.82, 0.92),
     # 新版 UI 通用左上角返回箭头（活动页/农场页同款同位）
@@ -103,6 +108,11 @@ TEMPLATE_THRESHOLDS = {
     "start_game.png": 0.75,
     "close_popup.png": 0.90,
     "close_popup_event.png": 0.78,
+    # 两张失败现场正样本均 1.000，全部参考截图噪声上限 0.544；
+    # 与 close_popup_event 同取 0.78，给跨分辨率高度缩放复用留余量
+    "close_popup_kpl.png": 0.78,
+    # 正样本 1.000，噪声上限 0.266；按钮样式通用，靠 ROI 排除同排其他按钮
+    "dialog_confirm.png": 0.85,
     "agree_terms.png": 0.85,
     # 白色箭头字形主导得分，换背景实测仍有 0.917（农场页），噪声上限 0.573
     "back_arrow.png": 0.80,
@@ -111,6 +121,15 @@ TEMPLATE_THRESHOLDS = {
     "oneclick_farm.png": 0.75,
     "harvest_continue.png": 0.85,
 }
+
+# 大厅各类弹窗的关闭控件（✕ / 确定），登录后任一步骤都可能冒出来，
+# 步骤3/4/5 共用：匹配到什么点什么，直到露出「来农场」入口
+LOBBY_POPUP_CLOSERS = [
+    "close_popup.png",
+    "close_popup_event.png",
+    "close_popup_kpl.png",
+    "dialog_confirm.png",
+]
 
 # ============================================================
 # 统计数据
@@ -1190,7 +1209,7 @@ def step3_click_start_game():
             while time.monotonic() < deadline:
                 screenshot(SCREENSHOT_PATH)
                 if find_any_template(
-                    ["close_popup.png", "close_popup_event.png", "lainongchang.png"],
+                    LOBBY_POPUP_CLOSERS + ["lainongchang.png"],
                     SCREENSHOT_PATH,
                 ):
                     print("  ✅ 大厅已就绪")
@@ -1229,9 +1248,7 @@ def step4_close_popup():
     miss_count = 0
     for i in range(10):  # 最多处理10个弹窗
         screenshot(SCREENSHOT_PATH)
-        result = find_any_template(
-            ["close_popup.png", "close_popup_event.png"], SCREENSHOT_PATH
-        )
+        result = find_any_template(LOBBY_POPUP_CLOSERS, SCREENSHOT_PATH)
 
         if result:
             x, y = result["x"], result["y"]
@@ -1271,6 +1288,13 @@ def step5_enter_farm():
                 return True
             save_diagnostic("step5_farm_timeout")
             return False
+
+        # 弹窗可能晚于步骤4才出现（KPL 观赛、休息提醒等）挡住入口，先关掉再找
+        popup = find_any_template(LOBBY_POPUP_CLOSERS, SCREENSHOT_PATH)
+        if popup:
+            tap(popup["x"], popup["y"], f"关闭弹窗/{popup['template']}")
+            time.sleep(2)
+            continue
 
         print(f"  ⏳ 等待2秒... ({attempt+1}/10)")
         time.sleep(2)
