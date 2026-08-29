@@ -281,7 +281,14 @@ class WirelessGuiHelperTests(unittest.TestCase):
             import wzry_gui
         except Exception as exc:  # 无 GUI 依赖的环境跳过
             raise unittest.SkipTest(f"GUI 依赖不可用: {exc}")
+        cls.gui_module = wzry_gui
         cls.FarmGui = wzry_gui.FarmGui
+
+    def test_crop_cycle_options_cover_supported_tiers(self):
+        self.assertEqual(
+            dict(self.gui_module.CROP_CYCLE_OPTIONS),
+            {"1 小时": 60, "8 小时": 480, "16 小时": 960, "32 小时": 1920},
+        )
 
     def test_normalize_appends_default_port(self):
         self.assertEqual(
@@ -407,44 +414,90 @@ class MaturityParsingTests(unittest.TestCase):
         maturity_dt, _ = self._read_maturity_with("明天14:00成熟", fake_now)
         self.assertEqual(maturity_dt, datetime(2026, 8, 27, 14, 0, 0))
 
-    def test_cross_day_remaining_matches_32h_tier(self):
-        # 剩余1759分钟（29小时19分）→ 32小时档，节点1280（播种后10h40那次）
-        now = datetime(2026, 8, 26, 13, 7, 0)
-        result = wzry_auto.calculate_next_water_time(
-            now + timedelta(minutes=1759), now=now
-        )
-        self.assertEqual(result["tier_min"], 1920)
-        self.assertEqual(result["node_min"], 1280)
-        self.assertEqual(result["next_water"], now + timedelta(minutes=1759 - 1280))
-
-    def test_short_remaining_uses_tier_node_not_rebase(self):
-        # 回归：剩余50分钟 → 1小时档节点40（播种后20分钟那次）→ 10分钟后浇水，
-        # 而不是以当前时刻为基准按周期比例重排
+    def _calculate_water_time(self, cycle_min, remain_min):
         now = datetime(2026, 8, 26, 10, 0, 0)
-        result = wzry_auto.calculate_next_water_time(
-            now + timedelta(minutes=50), now=now
-        )
-        self.assertEqual(result["tier_min"], 60)
-        self.assertEqual(result["node_min"], 40)
-        self.assertEqual(result["next_water"], now + timedelta(minutes=10))
+        with tempfile.TemporaryDirectory() as directory:
+            cycle_file = Path(directory) / "crop_cycle.json"
+            cycle_file.write_text(
+                json.dumps({"crop_name": "作物", "cycle_min": cycle_min}),
+                encoding="utf-8",
+            )
+            with patch.object(wzry_auto, "CYCLE_FILE", str(cycle_file)), \
+                 patch.dict(
+                     wzry_auto.os.environ, {"WZRY_CROP_CYCLE_MIN": ""}
+                 ):
+                result = wzry_auto.calculate_next_water_time(
+                    now + timedelta(minutes=remain_min), now=now
+                )
+        return now, result
 
-    def test_mid_remaining_matches_8h_tier(self):
-        # 剩余300分钟（5小时）→ 8小时档，节点160（播种后5h20那次）
-        now = datetime(2026, 8, 25, 10, 0, 0)
-        result = wzry_auto.calculate_next_water_time(
-            now + timedelta(minutes=300), now=now
-        )
+    def test_water_reduction_nodes_for_all_crop_tiers(self):
+        cases = {
+            60: [(55, 35, 20), (30, 10, 20), (5, 1, 4)],
+            480: [(440, 280, 160), (240, 80, 160), (40, 8, 32)],
+            960: [(880, 560, 320), (480, 160, 320), (80, 16, 64)],
+            1920: [(1760, 1120, 640), (960, 320, 640), (160, 32, 128)],
+        }
+        for cycle_min, stages in cases.items():
+            for remain_min, node_min, wait_min in stages:
+                with self.subTest(cycle_min=cycle_min, remain_min=remain_min):
+                    now, result = self._calculate_water_time(
+                        cycle_min, remain_min
+                    )
+                    self.assertEqual(result["tier_min"], cycle_min)
+                    self.assertEqual(result["node_min"], node_min)
+                    self.assertEqual(
+                        result["next_water"], now + timedelta(minutes=wait_min)
+                    )
+
+    def test_new_crop_infers_and_saves_original_cycle(self):
+        now = datetime(2026, 8, 26, 10, 0, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            cycle_file = Path(directory) / "crop_cycle.json"
+            with patch.object(wzry_auto, "CYCLE_FILE", str(cycle_file)):
+                result = wzry_auto.calculate_next_water_time(
+                    now + timedelta(minutes=440),
+                    now=now,
+                    save_if_fresh=True,
+                )
+                stored = json.loads(cycle_file.read_text(encoding="utf-8"))
         self.assertEqual(result["tier_min"], 480)
-        self.assertEqual(result["next_water"], now + timedelta(minutes=300 - 160))
+        self.assertEqual(result["node_min"], 280)
+        self.assertEqual(stored["cycle_min"], 480)
+
+    def test_original_tier_is_kept_after_remaining_time_drops(self):
+        # 16小时作物第二次浇水后剩480分钟，仍须使用16小时档节点160，
+        # 不能按剩余时间错误切换到8小时档。
+        now, result = self._calculate_water_time(960, 480)
+        self.assertEqual(result["tier_min"], 960)
+        self.assertEqual(result["node_min"], 160)
+        self.assertEqual(result["next_water"], now + timedelta(minutes=320))
+
+    def test_gui_selected_cycle_overrides_stored_cycle(self):
+        now = datetime(2026, 8, 26, 10, 0, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            cycle_file = Path(directory) / "crop_cycle.json"
+            cycle_file.write_text(
+                json.dumps({"crop_name": "作物", "cycle_min": 480}),
+                encoding="utf-8",
+            )
+            with patch.object(wzry_auto, "CYCLE_FILE", str(cycle_file)), \
+                 patch.dict(
+                     wzry_auto.os.environ,
+                     {"WZRY_CROP_CYCLE_MIN": "960"},
+                 ):
+                result = wzry_auto.calculate_next_water_time(
+                    now + timedelta(minutes=480), now=now
+                )
+        self.assertEqual(result["tier_min"], 960)
+        self.assertEqual(result["node_min"], 160)
 
     def test_past_last_node_waits_for_mature(self):
-        # 剩余15分钟已低于1小时档最后节点16，不再浇水，等成熟收获
-        now = datetime(2026, 8, 26, 10, 0, 0)
-        result = wzry_auto.calculate_next_water_time(
-            now + timedelta(minutes=15), now=now
-        )
+        now, result = self._calculate_water_time(60, 0.5)
         self.assertIsNone(result["next_water"])
-        self.assertEqual(result["mature_time"], now + timedelta(minutes=15))
+        self.assertEqual(
+            result["mature_time"], now + timedelta(minutes=0.5)
+        )
 
 
 class StatsTests(unittest.TestCase):

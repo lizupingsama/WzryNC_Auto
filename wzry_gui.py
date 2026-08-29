@@ -68,6 +68,14 @@ BRIGHTNESS_OPTIONS = [
     ("ROOT 亮度 1", "1"),
 ]
 
+# 作物原始成熟时间档位：显示文本 -> 分钟数
+CROP_CYCLE_OPTIONS = [
+    ("1 小时", 60),
+    ("8 小时", 480),
+    ("16 小时", 960),
+    ("32 小时", 1920),
+]
+
 # 外观选项：显示文本 -> customtkinter 外观模式
 APPEARANCE_OPTIONS = [
     ("浅色", "light"),
@@ -356,6 +364,38 @@ class FarmGui:
                 text_color=("gray20", "gray80"),
                 hover_color=("gray85", "gray25"),
             ).pack(side="right", padx=(8, 0), pady=10)
+
+        # 作物档位必须由用户明确选择，避免浇水减时后按剩余时间误判档位。
+        crop_opts = ctk.CTkFrame(self.root, corner_radius=12)
+        crop_opts.pack(fill="x", padx=pad, pady=(0, 8))
+        ctk.CTkLabel(
+            crop_opts, text="当前作物时间档位", font=self.font_body,
+        ).pack(side="left", padx=(14, 8), pady=10)
+        saved_cycle = self.config.get("crop_cycle_min", 480)
+        try:
+            saved_cycle = int(saved_cycle)
+        except (TypeError, ValueError):
+            saved_cycle = 480
+        saved_cycle_text = next(
+            (
+                text for text, value in CROP_CYCLE_OPTIONS
+                if value == saved_cycle
+            ),
+            CROP_CYCLE_OPTIONS[1][0],
+        )
+        self.crop_cycle_var = tk.StringVar(value=saved_cycle_text)
+        self.crop_cycle_menu = ctk.CTkOptionMenu(
+            crop_opts, values=[text for text, _ in CROP_CYCLE_OPTIONS],
+            variable=self.crop_cycle_var, width=130,
+            font=self.font_body, dropdown_font=self.font_body,
+            command=self._save_config,
+        )
+        self.crop_cycle_menu.pack(side="left", pady=10)
+        ctk.CTkLabel(
+            crop_opts,
+            text="启动挂机前请选择作物的原始成熟时长",
+            font=self.font_small, text_color=MUTED,
+        ).pack(side="left", padx=(12, 0), pady=10)
 
         # 设备行：无线地址 + 连接 / USB转无线 / 配对 + 锁屏密码 + 连接状态
         conn = ctk.CTkFrame(self.root, corner_radius=12)
@@ -919,11 +959,15 @@ class FarmGui:
         self._save_config()
 
         brightness = dict(BRIGHTNESS_OPTIONS).get(self.brightness_var.get(), "N")
+        crop_cycle_min = dict(CROP_CYCLE_OPTIONS).get(
+            self.crop_cycle_var.get(), 480
+        )
         env = {
             **os.environ,
             "PYTHONIOENCODING": "utf-8",
             "WZRY_GUI": "1",
             "WZRY_BRIGHTNESS": brightness,
+            "WZRY_CROP_CYCLE_MIN": str(crop_cycle_min),
         }
         wireless = self._normalize_wireless_addr(self.device_entry.get())
         if wireless:
@@ -1292,6 +1336,7 @@ class FarmGui:
             )
             self.btn_stop.configure(state="disabled", fg_color=DISABLED_BTN)
         self.brightness_menu.configure(state="disabled" if running else "normal")
+        self.crop_cycle_menu.configure(state="disabled" if running else "normal")
         self._refresh_adb_controls()
         if self._tray:
             try:
@@ -1663,6 +1708,9 @@ class FarmGui:
         cfg = dict(self.config)
         cfg.update({
             "brightness": dict(BRIGHTNESS_OPTIONS).get(self.brightness_var.get(), "N"),
+            "crop_cycle_min": dict(CROP_CYCLE_OPTIONS).get(
+                self.crop_cycle_var.get(), 480
+            ),
             "auto_start": bool(self.auto_start_var.get()),
             "start_minimized": bool(self.start_min_var.get()),
             "auto_restart": bool(self.auto_restart_var.get()),
