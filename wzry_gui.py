@@ -144,7 +144,7 @@ def make_icon_image(running):
 
 class FarmGui:
     QUEUE_INTERVAL = 100     # 日志/命令队列轮询 (ms)
-    STATS_INTERVAL = 2000    # stats.json 刷新 (ms)
+    STATS_INTERVAL = 1000    # stats.json 与倒计时刷新 (ms)
     MAX_LOG_LINES = 2000
     STOP_TIMEOUT = 40        # 点击停止后等待脚本清理现场的秒数
     QUIT_TIMEOUT = 25        # 退出助手时等待脚本清理的秒数
