@@ -1384,8 +1384,8 @@ def step8_close_harvest():
             time.sleep(1)
 
             click_template("harvest_continue.png", SCREENSHOT_PATH, label="继续")
-            print("  ⏳ 等待2秒...")
-            time.sleep(2)
+            print("  ⏳ 收获弹窗已关闭，等待5秒...")
+            time.sleep(5)
             return True, harvested
         else:
             if attempt == 0:
