@@ -4,7 +4,7 @@
 以子进程方式运行挂机核心（脚本模式 wzry_auto.py / 打包模式 wzry_core.exe）：
 - 窗口内实时显示脚本日志、累计统计与下次唤醒倒计时
 - 点击关闭按钮最小化到系统托盘，不占用任务栏
-- 托盘菜单：显示主界面 / 启动挂机 / 停止挂机 / 统计面板 / 退出
+- 托盘菜单：显示主界面 / 启动挂机 / 停止挂机 / 暂停挂机 / 统计面板 / 退出
 - 停止时通过 stdin 管道通知脚本优雅退出（退出游戏、恢复手机亮度）；
   即使助手被强杀，子进程也会因管道 EOF 自行退出，不会留孤儿进程
 
@@ -92,6 +92,7 @@ STOP_HOVER = ("#C9302C", "#8B3634")
 STATUS_COLORS = {
     "idle": MUTED,
     "running": ACCENT,
+    "paused": ("#3D7BC7", "#5B9BE8"),
     "stopping": ("#E8890C", "#F0A030"),
 }
 
@@ -155,6 +156,7 @@ class FarmGui:
         self.cmd_queue = queue.Queue()
         self.user_stop = False
         self._running = False
+        self._paused = False
         self._quitting = False
         self._quit_deadline = None
         self._restart_job = None
@@ -219,7 +221,7 @@ class FarmGui:
     # ------------------------------------------------------------
     def _build_ui(self):
         self.root.title(f"{APP_TITLE} v{APP_VERSION}" if APP_VERSION else APP_TITLE)
-        self.root.geometry("960x680")
+        self.root.geometry("1060x680")
         self.root.minsize(880, 560)
         pad = 14
 
@@ -239,13 +241,14 @@ class FarmGui:
             font=self.font_title, text_color=STATUS_COLORS["idle"],
         )
         self.status_label.pack(side="left")
-        # 设备名 + 连接状态，紧跟运行状态显示（此处横向空间充裕不会被挤裁）
+        # 设备名 + 连接状态，紧跟运行状态显示。控件在这里创建、但要等右侧
+        # 按钮都 pack 完才 pack（见下面那行）：pack 按登记顺序分配空间，
+        # 排在最后的才会在窗口被拉窄时先被裁掉——宁可截设备名，也别挤没按钮。
         self.device_status_var = tk.StringVar(value="●  检测设备中…")
         self.device_status_label = ctk.CTkLabel(
             header, textvariable=self.device_status_var,
             font=self.font_small, text_color=MUTED, anchor="w",
         )
-        self.device_status_label.pack(side="left", padx=(18, 0))
 
         self.btn_start = ctk.CTkButton(
             header, text="启动挂机", width=104, font=self.font_body,
@@ -261,6 +264,15 @@ class FarmGui:
             text_color_disabled=("gray45", "gray55"),
         )
         self.btn_stop.pack(side="right", padx=(8, 0))
+        # 暂停/继续：核心会在最近的安全闸口停住，恢复后从原地接着跑
+        self.btn_pause = ctk.CTkButton(
+            header, text="暂停", width=84, font=self.font_body,
+            command=self.toggle_pause, text_color_disabled=("gray45", "gray55"),
+        )
+        self._pause_fg = self.btn_pause.cget("fg_color")
+        self._pause_hover = self.btn_pause.cget("hover_color")
+        self.btn_pause.configure(state="disabled", fg_color=DISABLED_BTN)
+        self.btn_pause.pack(side="right", padx=(8, 0))
         # 未运行 = 启动挂机并立即执行首轮；运行中 = 跳过等待提前开始新一轮
         self.btn_farm_now = ctk.CTkButton(
             header, text="立刻务农", width=104, font=self.font_body,
@@ -275,6 +287,7 @@ class FarmGui:
                 text_color=("gray20", "gray80"),
                 hover_color=("gray85", "gray25"),
             ).pack(side="right", padx=(8, 0))
+        self.device_status_label.pack(side="left", padx=(18, 0))
 
         # 统计卡片：轮数 / 收获 / 经验 / 下次启动
         cards = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -881,6 +894,11 @@ class FarmGui:
                 "停止挂机", lambda *a: self.cmd_queue.put(("stop", None)),
                 enabled=lambda *a: self._running,
             ),
+            pystray.MenuItem(
+                lambda *a: "继续挂机" if self._paused else "暂停挂机",
+                lambda *a: self.cmd_queue.put(("pause", None)),
+                enabled=lambda *a: self._running,
+            ),
             pystray.MenuItem("立刻务农", lambda *a: self.cmd_queue.put(("farm_now", None))),
             pystray.MenuItem("统计面板", lambda *a: self.cmd_queue.put(("stats", None))),
             pystray.MenuItem(
@@ -1050,11 +1068,47 @@ class FarmGui:
         if self.user_stop or self._quitting:
             self._append_log("[助手] 正在停止挂机，无法立刻务农\n")
             return
+        if self._paused:
+            self._append_log("[助手] 挂机已暂停，请先点「继续」再立刻务农\n")
+            return
         try:
             proc.stdin.write("farm_now\n")
             proc.stdin.flush()
         except (OSError, ValueError):
             self._append_log("[助手] ⚠️ 立刻务农指令发送失败，请停止后重新启动挂机\n")
+
+    def toggle_pause(self):
+        """暂停 / 继续当前挂机。
+
+        经 stdin 通知核心：核心会把当前这一步动作（一次点击、一次截图）做完，
+        再在闸口停住，因此不会留下半个动作；恢复后从原地继续，不重跑本轮。
+        暂停期间手机停在当前画面，等待中的下一轮唤醒时间也照旧按真实时间走。
+        """
+        proc = self.proc
+        if not proc or proc.poll() is not None:
+            return
+        if self.user_stop or self._quitting:
+            self._append_log("[助手] 正在停止挂机，无法暂停\n")
+            return
+        want_pause = not self._paused
+        try:
+            proc.stdin.write("pause\n" if want_pause else "resume\n")
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            self._append_log("[助手] ⚠️ 暂停指令发送失败，请停止后重新启动挂机\n")
+            return
+        self._set_paused(want_pause)
+
+    def _set_paused(self, paused):
+        self._paused = paused
+        self.btn_pause.configure(text="继续" if paused else "暂停")
+        if paused:
+            self._set_status("paused", "●  已暂停")
+            self._append_log("[助手] 已发送暂停指令，核心会在当前这一步动作做完后停住\n")
+        else:
+            self._set_status("running", "●  挂机运行中")
+            self._append_log("[助手] 已发送恢复指令，从暂停处继续\n")
+        self._refresh_tray()
 
     def stop_bot(self):
         proc = self.proc
@@ -1065,6 +1119,7 @@ class FarmGui:
         self.user_stop = True
         self._set_status("stopping", "●  正在停止...")
         self.btn_stop.configure(state="disabled", fg_color=DISABLED_BTN)
+        self.btn_pause.configure(state="disabled", fg_color=DISABLED_BTN)
         self._append_log("[助手] 正在停止挂机（脚本会退出游戏并恢复手机亮度）...\n")
         self._send_stop(proc)
         threading.Thread(
@@ -1165,6 +1220,8 @@ class FarmGui:
                     self.start_bot()
                 elif kind == "stop":
                     self.stop_bot()
+                elif kind == "pause":
+                    self.toggle_pause()
                 elif kind == "farm_now":
                     self.farm_now()
                 elif kind == "stats":
@@ -1325,25 +1382,40 @@ class FarmGui:
 
     def _set_running(self, running):
         self._running = running
+        # 进程刚起或刚退，上一次的暂停态都已作废
+        self._paused = False
+        self.btn_pause.configure(text="暂停")
         if running:
             self._set_status("running", "●  挂机运行中")
             self.btn_start.configure(state="disabled", fg_color=DISABLED_BTN)
             self.btn_stop.configure(state="normal", fg_color=STOP_FG)
+            self.btn_pause.configure(
+                state="normal", fg_color=self._pause_fg, hover_color=self._pause_hover,
+            )
         else:
             self._set_status("idle", "●  未运行")
             self.btn_start.configure(
                 state="normal", fg_color=self._start_fg, hover_color=self._start_hover,
             )
             self.btn_stop.configure(state="disabled", fg_color=DISABLED_BTN)
+            self.btn_pause.configure(state="disabled", fg_color=DISABLED_BTN)
         self.brightness_menu.configure(state="disabled" if running else "normal")
         self.crop_cycle_menu.configure(state="disabled" if running else "normal")
         self._refresh_adb_controls()
-        if self._tray:
-            try:
-                self._tray.icon = make_icon_image(running)
-                self._tray.title = f"{APP_TITLE}（{'运行中' if running else '未运行'}）"
-            except Exception:
-                pass
+        self._refresh_tray()
+
+    def _refresh_tray(self):
+        if not self._tray:
+            return
+        if self._running:
+            state = "已暂停" if self._paused else "运行中"
+        else:
+            state = "未运行"
+        try:
+            self._tray.icon = make_icon_image(self._running)
+            self._tray.title = f"{APP_TITLE}（{state}）"
+        except Exception:
+            pass
 
     # ------------------------------------------------------------
     # 外观与状态

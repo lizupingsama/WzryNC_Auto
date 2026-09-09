@@ -1,6 +1,11 @@
+import contextlib
+import io
 import json
+import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -542,6 +547,112 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(second.total_exp, 100)
         self.assertEqual(second.total_crops, {"梨子": 7})
         self.assertEqual(second.rounds_log[-1]["status"], "中断退出")
+
+
+class PauseTests(unittest.TestCase):
+    """暂停/恢复：闸口必须挡在动作之前，且停止时一定要放行。"""
+
+    def tearDown(self):
+        wzry_auto._paused.clear()
+        wzry_auto._farm_now.clear()
+        wzry_auto._idle_wait.clear()
+
+    @staticmethod
+    def _call_async(func, *args):
+        """在后台线程里跑一个会被闸口挡住的调用，返回 (线程, 完成标志)。"""
+        done = threading.Event()
+
+        def run():
+            func(*args)
+            done.set()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, done
+
+    def _feed_watcher(self, *commands):
+        """喂一串指令给 GUI 指令监听线程，跑到 EOF 为止；返回它打印的内容。"""
+        script = "".join(f"{cmd}\n" for cmd in commands)
+        buffer = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {"WZRY_GUI": "1"}))
+            stack.enter_context(
+                patch.object(wzry_auto.sys, "stdin", io.StringIO(script))
+            )
+            raise_signal = stack.enter_context(
+                patch.object(wzry_auto.signal, "raise_signal")
+            )
+            stack.enter_context(contextlib.redirect_stdout(buffer))
+            wzry_auto._start_gui_stop_watcher()
+            # 监听线程没有句柄可 join（且 StringIO 读到 EOF 快到抓不住），
+            # 就等它走完最后一步——发信号；那之前的清理必然已经做完
+            deadline = time.monotonic() + 5
+            while not raise_signal.called and time.monotonic() < deadline:
+                time.sleep(0.01)
+        raise_signal.assert_called_once_with(wzry_auto.signal.SIGINT)
+        return buffer.getvalue()
+
+    def test_gate_blocks_until_resumed(self):
+        wzry_auto._paused.set()
+        with contextlib.redirect_stdout(io.StringIO()):
+            thread, done = self._call_async(wzry_auto.pause_gate)
+            self.assertFalse(done.wait(0.5), "暂停期间闸口不该放行")
+            wzry_auto._paused.clear()
+            self.assertTrue(done.wait(3), "恢复后闸口应立刻放行")
+            thread.join(timeout=3)
+
+    def test_input_injection_waits_behind_the_gate(self):
+        """暂停后不能再有指令打到手机——闸口必须挡在 adb_command 之前。"""
+        wzry_auto._paused.set()
+        with patch("wzry_auto.adb_command") as adb_command:
+            adb_command.return_value = subprocess.CompletedProcess([], 0, "", "")
+            with contextlib.redirect_stdout(io.StringIO()):
+                thread, done = self._call_async(wzry_auto.adb_input, "input tap 1 2")
+                self.assertFalse(done.wait(0.5))
+                adb_command.assert_not_called()
+                wzry_auto._paused.clear()
+                self.assertTrue(done.wait(3))
+                thread.join(timeout=3)
+            adb_command.assert_called_once()
+
+    def test_pause_does_not_extend_the_wait(self):
+        """作物成熟只认墙上时钟：暂停期间等待照常走完，恢复后不补等。"""
+        wzry_auto._paused.set()
+        with contextlib.redirect_stdout(io.StringIO()):
+            thread, done = self._call_async(wzry_auto.wait_or_farm_now, 0.3)
+            time.sleep(1.0)          # 等待时长早已走完，但闸口还挡着
+            self.assertFalse(done.is_set())
+            resumed_at = time.monotonic()
+            wzry_auto._paused.clear()
+            self.assertTrue(done.wait(3))
+            thread.join(timeout=3)
+        self.assertLess(time.monotonic() - resumed_at, 1.0)
+
+    def test_stop_releases_the_gate(self):
+        """暂停中点停止：必须先放行闸口，主线程才走得到清理与退出。"""
+        output = self._feed_watcher("pause", "stop")
+        self.assertFalse(wzry_auto._paused.is_set())
+        self.assertIn("收到暂停指令", output)
+
+    def test_pipe_eof_releases_the_gate(self):
+        """助手被强杀时管道 EOF 同样要放行，别留下卡死的挂机进程。"""
+        self._feed_watcher("pause")
+        self.assertFalse(wzry_auto._paused.is_set())
+
+    def test_resume_clears_the_gate(self):
+        output = self._feed_watcher("pause", "resume")
+        self.assertIn("收到恢复指令", output)
+
+    def test_farm_now_rejected_while_paused(self):
+        wzry_auto._idle_wait.set()
+        output = self._feed_watcher("pause", "farm_now")
+        self.assertFalse(wzry_auto._farm_now.is_set())
+        self.assertIn("已驳回", output)
+
+    def test_farm_now_still_accepted_when_not_paused(self):
+        wzry_auto._idle_wait.set()
+        self._feed_watcher("farm_now")
+        self.assertTrue(wzry_auto._farm_now.is_set())
 
 
 if __name__ == "__main__":

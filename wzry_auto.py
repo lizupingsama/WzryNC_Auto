@@ -286,6 +286,24 @@ if hasattr(signal, "SIGBREAK"):
 _farm_now = threading.Event()
 _idle_wait = threading.Event()
 
+# “暂停/恢复”指令（GUI 经 stdin 发送）：置位 _paused 后，主流程会在最近的
+# 闸口原地停住。闸口铺在 adb_input / screenshot / 轮次等待三处，覆盖了所有
+# 会碰到手机的动作，暂停后不会再有新指令打到手机，也不会卡在半个动作中间。
+_paused = threading.Event()
+
+def pause_gate():
+    """暂停闸口：_paused 置位时原地等待，恢复后返回、继续原来的流程。
+
+    与 wait_or_farm_now 同理必须用分段 time.sleep 轮询而不是 Event.wait：
+    Windows 下锁等待不会被 SIGINT 唤醒，那样暂停期间点「停止挂机」会失效。
+    """
+    if not _paused.is_set():
+        return
+    print("\n⏸️ 已暂停，手机保持当前画面，等待恢复...")
+    while _paused.is_set():
+        time.sleep(0.2)
+    print("▶️ 已恢复，继续执行")
+
 def wait_or_farm_now(seconds):
     """轮次之间的等待，可被“立刻务农”指令打断；返回 True 表示被打断。
 
@@ -297,6 +315,9 @@ def wait_or_farm_now(seconds):
     _idle_wait.set()
     try:
         while True:
+            # 暂停期间真实时间照常流逝，恢复后若已过点会立即返回，
+            # 不会把等待时长凭空拉长（作物成熟只认墙上时钟）
+            pause_gate()
             if _farm_now.is_set():
                 _farm_now.clear()
                 print("  ⚡ 立刻务农：跳过等待，马上开始新一轮")
@@ -712,6 +733,7 @@ def screenshot(path=SCREENSHOT_PATH):
     不能用 adb pull 写本地文件：platform-tools 35+ 在 Windows 上遇到含中文的
     本地路径会报 cannot create file/directory（且行为不稳定），打包目录名
     「王者农场助手」正好踩中。失败时清除旧图避免误用陈旧画面。"""
+    pause_gate()
     try:
         result = subprocess.run(
             [ADB, "-s", DEVICE, "exec-out", "screencap", "-p"],
@@ -753,6 +775,7 @@ def adb_input(cmd):
     """执行 input 注入并暴露失败原因。
     小米/红米未开启「USB调试（安全设置）」时 input 抛 SecurityException，
     但只写入 stderr，静默吞掉就会表现成"识别到但点不到"。"""
+    pause_gate()
     result = adb_command("shell", cmd, timeout=10)
     noise = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
     if "Exception" in noise or "INJECT_EVENTS" in noise or "permission" in noise.lower():
@@ -1889,7 +1912,8 @@ def main():
 def _start_gui_stop_watcher():
     """GUI 模式（WZRY_GUI=1）：监听 stdin。收到 stop 或管道断开时优雅退出；
     收到 farm_now 且正处于轮次间等待时置位 _farm_now 马上开始新一轮，
-    务农步骤执行中则驳回（避免把指令攒到本轮结束后多跑一轮）。
+    务农步骤执行中则驳回（避免把指令攒到本轮结束后多跑一轮）；
+    收到 pause / resume 则置位或清除 _paused，由 pause_gate 就地停住与续跑。
 
     图形助手（wzry_gui.py）以管道接管本进程 stdin。即使助手被强制结束，
     管道 EOF 也会触发这里的退出流程，避免留下无人管理的挂机进程。
@@ -1906,14 +1930,26 @@ def _start_gui_stop_watcher():
                 cmd = line.strip().lower()
                 if cmd == "stop":
                     break
-                if cmd == "farm_now":
-                    if _idle_wait.is_set():
+                elif cmd == "pause":
+                    if not _paused.is_set():
+                        _paused.set()
+                        print("\n⏸️ 收到暂停指令，当前这一步动作做完后就停住")
+                elif cmd == "resume":
+                    if _paused.is_set():
+                        _paused.clear()
+                        print("\n▶️ 收到恢复指令，从暂停处继续")
+                elif cmd == "farm_now":
+                    if _paused.is_set():
+                        print("\n⚠️ 当前已暂停，立刻务农已驳回（请先恢复挂机）")
+                    elif _idle_wait.is_set():
                         print("\n⚡ 收到立刻务农指令，马上开始新一轮")
                         _farm_now.set()
                     else:
                         print("\n⚠️ 正在执行务农流程，立刻务农已驳回（等待下一轮期间才可用）")
         except (OSError, ValueError):
             pass
+        # 先放行闸口：主线程要能走出 pause_gate，优雅退出才谈得上生效
+        _paused.clear()
         print("\n⚠️ 收到助手停止指令（或助手已关闭），正在退出...")
         signal.raise_signal(signal.SIGINT)
 
@@ -1929,6 +1965,8 @@ def run_main():
     except Exception as e:
         print(f"\n\n❌ 发生错误: {e}")
     finally:
+        # 暂停中被停止时，收尾的退游戏/恢复亮度不能卡在 pause_gate 里
+        _paused.clear()
         force_stop_game()
         # 恢复亮度设置
         restore_brightness()
