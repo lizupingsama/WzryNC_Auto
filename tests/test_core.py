@@ -655,5 +655,55 @@ class PauseTests(unittest.TestCase):
         self.assertTrue(wzry_auto._farm_now.is_set())
 
 
+class KeepAwakeTests(unittest.TestCase):
+    """挂机期间阻止电脑睡眠：等待是进程内倒计时，系统一睡就到点不醒。"""
+
+    @staticmethod
+    def _windows_env(keep_awake=""):
+        """伪装成 Windows 并清掉开关，让测试在任何平台上结果一致。"""
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(wzry_auto.os, "name", "nt"))
+        stack.enter_context(
+            patch.dict(os.environ, {"WZRY_KEEP_AWAKE": keep_awake})
+        )
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        return stack
+
+    def test_request_keeps_system_up_but_lets_screen_sleep(self):
+        with self._windows_env(),              patch.object(
+                 wzry_auto, "_set_execution_state", return_value=True
+             ) as call:
+            self.assertTrue(wzry_auto.keep_system_awake())
+        # 必须只有 CONTINUOUS|SYSTEM_REQUIRED：多带 ES_DISPLAY_REQUIRED
+        # 会让屏幕常亮，挂机一整夜没人愿意
+        call.assert_called_once_with(
+            wzry_auto.ES_CONTINUOUS | wzry_auto.ES_SYSTEM_REQUIRED
+        )
+
+    def test_release_clears_the_request(self):
+        with self._windows_env(),              patch.object(
+                 wzry_auto, "_set_execution_state", return_value=True
+             ) as call:
+            wzry_auto.allow_system_sleep()
+        call.assert_called_once_with(wzry_auto.ES_CONTINUOUS)
+
+    def test_env_switch_disables_the_request(self):
+        with self._windows_env(keep_awake="0"),              patch.object(wzry_auto, "_set_execution_state") as call:
+            self.assertFalse(wzry_auto.keep_system_awake())
+        call.assert_not_called()
+
+    def test_non_windows_is_a_no_op(self):
+        with patch.object(wzry_auto.os, "name", "posix"),              patch.dict(os.environ, {"WZRY_KEEP_AWAKE": ""}),              patch("ctypes.WinDLL", create=True) as windll:
+            self.assertFalse(wzry_auto.keep_system_awake())
+            wzry_auto.allow_system_sleep()
+        windll.assert_not_called()
+
+    def test_failed_request_does_not_stop_farming(self):
+        with self._windows_env(),              patch.object(
+                 wzry_auto, "_set_execution_state", return_value=False
+             ):
+            self.assertFalse(wzry_auto.keep_system_awake())
+
+
 if __name__ == "__main__":
     unittest.main()

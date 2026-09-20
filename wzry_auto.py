@@ -330,6 +330,51 @@ def wait_or_farm_now(seconds):
         _idle_wait.clear()
 
 # ============================================================
+# 阻止电脑睡眠
+# ============================================================
+# 轮次之间是进程内的 time.sleep 轮询倒计时，电脑一睡整个进程就被冻住：
+# 到点不会醒，程序也没有任何办法把电脑叫起来，只能等人回来开机后补跑
+# （统计里表现为"一开机就务农"，整条浇水时间线往后平移）。挂机期间向
+# 系统声明 ES_SYSTEM_REQUIRED 禁止自动睡眠；不带 ES_DISPLAY_REQUIRED，
+# 屏幕照常熄灭。执行状态绑定调用线程，取消必须在同一线程，进程异常退出
+# 时由系统自动清除。设 WZRY_KEEP_AWAKE=0 可关掉本功能。
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _set_execution_state(flags):
+    """调用 Win32 SetThreadExecutionState；返回 True 表示设置成功。"""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetThreadExecutionState.argtypes = [ctypes.c_uint32]
+        kernel32.SetThreadExecutionState.restype = ctypes.c_uint32
+        return bool(kernel32.SetThreadExecutionState(flags))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def keep_system_awake():
+    """挂机期间禁止电脑自动睡眠；返回 True 表示已生效。"""
+    if os.name != "nt":
+        return False
+    if os.environ.get("WZRY_KEEP_AWAKE") == "0":
+        print("  💤 已按 WZRY_KEEP_AWAKE=0 跳过阻止睡眠，电脑睡眠会中断挂机")
+        return False
+    if not _set_execution_state(ES_CONTINUOUS | ES_SYSTEM_REQUIRED):
+        print("  ⚠️ 阻止电脑睡眠未生效（不影响挂机），请自行关闭系统睡眠")
+        return False
+    print("  ☕ 已阻止电脑自动睡眠（屏幕仍会正常熄灭），退出后自动恢复")
+    return True
+
+
+def allow_system_sleep():
+    """恢复系统默认睡眠策略；须与 keep_system_awake 在同一线程调用。"""
+    _set_execution_state(ES_CONTINUOUS)
+
+# ============================================================
 # 浇水时间计算
 # ============================================================
 import json
@@ -1764,7 +1809,10 @@ def main():
     # 单实例锁：防止两个脚本同时操作同一台设备
     if not acquire_instance_lock():
         return
-    
+
+    # 挂机期间禁止电脑睡眠，否则倒计时随进程一起冻住、到点不会醒
+    keep_system_awake()
+
     # 询问是否降低亮度
     global _brightness_mode
     _brightness_mode = prompt_brightness_control()
@@ -1956,7 +2004,7 @@ def _start_gui_stop_watcher():
     threading.Thread(target=watch, daemon=True, name="gui-stop-watcher").start()
 
 def run_main():
-    """运行主流程，确保退出时恢复亮度"""
+    """运行主流程，确保退出时恢复亮度与系统睡眠策略"""
     _start_gui_stop_watcher()
     try:
         main()
@@ -1970,6 +2018,8 @@ def run_main():
         force_stop_game()
         # 恢复亮度设置
         restore_brightness()
+        # 交还电脑的睡眠控制权（与 keep_system_awake 同在主线程）
+        allow_system_sleep()
         print("\n👋 脚本已退出")
 
 def run_selftest():
