@@ -107,6 +107,40 @@ STEP6_CONFIG = {
 # 默认步骤6配置
 _step6_cfg = {"center": (160, 486), "angle": 120, "distance": 200, "duration": 1500}
 
+# 步骤7贴脸补步：一键务农按钮只在人走到石像跟前才冒出来，差几步不弹，
+# 走过头冲进土地里也不弹（那边只给「浇水」）。没弹时按这几个比例（相对
+# 步骤6推杆时长）再补几次短推、每次都回看一眼，比整轮重启游戏便宜得多；
+# 补步仍无果才由主流程刷新站位把人拉回石盘重走。
+STEP7_NUDGE_RATIOS = (0.25, 0.25, 0.35)
+
+
+def _step6_env_int(name, current, minimum, maximum):
+    """读整数型环境变量覆盖推杆参数；缺失、非法或越界一律保持原值。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return current
+    try:
+        value = int(float(raw))
+    except ValueError:
+        print(f"  ⚠️ {name} 无法识别（{raw}），保持 {current}")
+        return current
+    if not minimum <= value <= maximum:
+        print(f"  ⚠️ {name} 超出 {minimum}~{maximum}（{raw}），保持 {current}")
+        return current
+    return value
+
+
+def apply_step6_env_overrides(cfg):
+    """用 WZRY_STEP6_ANGLE / _DISTANCE / _DURATION 覆盖步骤6推杆参数。
+    换手机、改了游戏摇杆灵敏度或农场布局挪了位导致走不到（或走过）石像时，
+    不必改代码重新打包，调环境变量即可：duration 是按住摇杆的毫秒数，决定
+    走多远；distance 是推杆幅度，决定走多快；angle 是方向。"""
+    cfg = dict(cfg)
+    cfg["angle"] = _step6_env_int("WZRY_STEP6_ANGLE", cfg["angle"], 0, 360)
+    cfg["distance"] = _step6_env_int("WZRY_STEP6_DISTANCE", cfg["distance"], 50, 2000)
+    cfg["duration"] = _step6_env_int("WZRY_STEP6_DURATION", cfg["duration"], 200, 6000)
+    return cfg
+
 # 模板搜索区域使用归一化坐标 (x1, y1, x2, y2)，减少动态背景误匹配。
 TEMPLATE_ROIS = {
     "start_game.png": (0.25, 0.55, 0.75, 1.00),
@@ -1064,15 +1098,25 @@ def move_joystick(angle_deg, distance=200, duration_ms=1500, center=None):
     swipe(cx, cy, tx, ty, duration_ms)
     print(f"  🎮 摇杆 ({cx},{cy})→({tx},{ty}) {angle_deg}° {duration_ms}ms")
 
-def check_at_initial_position():
-    """检查角色是否在初始位置（石盘）"""
+def in_farm_scene():
+    """是否已进入农场场景。
+
+    判据是「刷新站位」按钮，但它在农场里**始终**可见：2026-08-25 那张走过头
+    站到土地正中的失败截图，refresh_pos 照样匹配到 0.926。所以它只能说明
+    「在农场」，说明不了「站在石盘上」，别再拿来当在不在初始位置的判据。
+    """
     screenshot(SCREENSHOT_PATH)
-    # 检查是否有refresh_pos按钮（在初始位置才会显示）
     return has_template("refresh_pos.png", SCREENSHOT_PATH)
 
 def reset_position():
-    """刷新站位重置角色位置"""
+    """点农场右下角的 ↻ 按钮（「种植」右边那颗）。
+
+    2026-09-21 手动实测：点一下角色传送回出生点，**镜头朝向也一并复位**。
+    视角复位这条尤其要紧——摇杆方向是相对镜头的，只把人拉回去而镜头还歪着，
+    同样的角度会走去别的地方。所以它给的是一个位置和朝向都确定的起点。
+    """
     print("  🔄 刷新站位...")
+    screenshot(SCREENSHOT_PATH)
     if click_template("refresh_pos.png", SCREENSHOT_PATH, label="刷新站位"):
         print("  ⏳ 等待3秒...")
         time.sleep(3)
@@ -1481,17 +1525,24 @@ def step5_enter_farm():
 # ============================================================
 # 步骤6: 移动到雕像
 # ============================================================
-def step6_move_to_statue():
-    """步骤6: 移动到雕像"""
+def step6_move_to_statue(reset_first=False):
+    """步骤6: 移动到雕像。
+
+    reset_first=True 用于步骤7失败后的重走：推杆是从**当前**位置起步的，
+    不先刷新站位就再推一次，等于在上一次的落点上又走一段，直接冲过石像
+    走进土地里（2026-08-25 相隔 40 秒的两张失败截图正是这么来的）。
+    刷新站位会把位置和镜头一起复位，所以重走的起点与首次完全一致。
+    """
     print("\n[步骤6] 移动到雕像...")
-    
-    # 检查是否在初始位置
-    if check_at_initial_position():
-        print("  ✅ 在初始位置")
-    else:
-        print("  🔄 不在初始位置，刷新站位...")
-        reset_position()
-    
+
+    if reset_first:
+        if reset_position():
+            print("  ✅ 已刷新站位，回到石盘")
+        else:
+            print("  ⚠️ 没点到刷新站位，按当前位置继续")
+    elif in_farm_scene():
+        print("  ✅ 农场场景就绪")
+
     # 使用分辨率专属配置或默认参数
     cfg = _step6_cfg
     move_joystick(cfg["angle"], cfg["distance"], cfg["duration"], center=cfg["center"])
@@ -1502,28 +1553,53 @@ def step6_move_to_statue():
 # ============================================================
 # 步骤7: 一键务农
 # ============================================================
-def step7_oneclick_farm():
-    """步骤7: 一键务农，返回 (是否成功, 实际点击时间)。"""
-    print("\n[步骤7] 一键务农...")
-    
-    screenshot(SCREENSHOT_PATH)
-    
-    if has_template("oneclick_farm.png", SCREENSHOT_PATH):
-        print("  ✅ 找到一键务农按钮")
-        print("  ⏳ 等待1秒...")
-        time.sleep(1)
+def step7_oneclick_farm(nudge=True):
+    """步骤7: 一键务农，返回 (是否成功, 实际点击时间)。
 
-        if not click_template("oneclick_farm.png", SCREENSHOT_PATH, label="一键务农"):
-            return False, None
-        farm_time = datetime.now()
-        print(f"  🕐 一键务农时间: {farm_time.strftime('%H:%M:%S')}")
-        print("  ⏳ 等待2秒...")
-        time.sleep(2)
-        return True, farm_time
-    else:
+    按钮没弹出来最常见的原因是差几步没走到石像跟前，此时朝原方向补几次
+    短推再看就行，不必整轮重启游戏——那要两分多钟，还会把浇水节点推后。
+    nudge=False 用于主流程刷新站位后的第二次尝试：刷新站位把位置和镜头都
+    复位了，那一次的起点与第一次分毫不差，补步只会原样重演一遍已经失败过的
+    结果，不如直接判失败、存现场，把时间留给整轮重来。
+    """
+    print("\n[步骤7] 一键务农...")
+
+    screenshot(SCREENSHOT_PATH)
+    found = has_template("oneclick_farm.png", SCREENSHOT_PATH)
+
+    if not found and nudge:
+        cfg = _step6_cfg
+        total = len(STEP7_NUDGE_RATIOS)
+        for index, ratio in enumerate(STEP7_NUDGE_RATIOS, 1):
+            print(f"  👣 按钮没弹，朝石像补一小步 ({index}/{total})")
+            move_joystick(
+                cfg["angle"],
+                cfg["distance"],
+                max(200, int(cfg["duration"] * ratio)),
+                center=cfg["center"],
+            )
+            time.sleep(1.5)
+            screenshot(SCREENSHOT_PATH)
+            if has_template("oneclick_farm.png", SCREENSHOT_PATH):
+                found = True
+                break
+
+    if not found:
         print("  ❌ 未找到一键务农，返回步骤6")
         save_diagnostic("step7_oneclick")
         return False, None
+
+    print("  ✅ 找到一键务农按钮")
+    print("  ⏳ 等待1秒...")
+    time.sleep(1)
+
+    if not click_template("oneclick_farm.png", SCREENSHOT_PATH, label="一键务农"):
+        return False, None
+    farm_time = datetime.now()
+    print(f"  🕐 一键务农时间: {farm_time.strftime('%H:%M:%S')}")
+    print("  ⏳ 等待2秒...")
+    time.sleep(2)
+    return True, farm_time
 
 # ============================================================
 # 步骤8: 关闭收获弹窗
@@ -2165,6 +2241,13 @@ def main():
         }
         print(f"  🎯 步骤6使用缩放配置: {_step6_cfg}")
 
+    # 走不到（或走过）石像时不用改代码重新打包，调这三个环境变量即可
+    tuned = apply_step6_env_overrides(_step6_cfg)
+    if tuned != _step6_cfg:
+        _step6_cfg = tuned
+        print(f"  🔧 步骤6按环境变量调整: 角度{_step6_cfg['angle']}° "
+              f"距离{_step6_cfg['distance']}px 时间{_step6_cfg['duration']}ms")
+
     # 记下这台手机的唯一识别码，并尝试接力手机上的存档：读到存档就等到
     # 存档里的浇水节点再动手，不再一连上设备就先白浇一次水
     global DEVICE_ID
@@ -2239,9 +2322,9 @@ def main():
             # 步骤7: 一键务农
             farm_ok, _ = step7_oneclick_farm()
             if not farm_ok:
-                print("\n⚠️ 步骤7失败，返回步骤6...")
-                step6_move_to_statue()
-                farm_ok, _ = step7_oneclick_farm()
+                print("\n⚠️ 步骤7失败，刷新站位后从石盘重走...")
+                step6_move_to_statue(reset_first=True)
+                farm_ok, _ = step7_oneclick_farm(nudge=False)
             if not farm_ok:
                 print("\n❌ 步骤7连续失败，本轮结束")
                 stats.finish_round("失败：未找到一键务农")

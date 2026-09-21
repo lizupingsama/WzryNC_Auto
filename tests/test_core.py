@@ -960,5 +960,125 @@ class WakeLeadTests(unittest.TestCase):
         self.assertEqual(recorded[1], node_at)
 
 
+class StatueApproachTests(unittest.TestCase):
+    """走到石像跟前这一段：刷新站位的语义、补步重试、推杆参数可调。"""
+
+    def test_refresh_button_shows_even_when_walked_past_the_statue(self):
+        # 回归：refresh_pos 曾被当成"站在石盘上"的判据，可它在农场里始终
+        # 可见——人走过头站到土地上照样匹配得到。判据失真的后果是步骤7失败
+        # 后从不刷新站位，直接在落点上再推一次杆，越走越远
+        shot = str(ROOT / "assets" / "screenshots" / "juesezhanzaitudishang.png")
+        with contextlib.redirect_stdout(io.StringIO()):
+            refresh = wzry_auto.find_template("refresh_pos.png", shot)
+            oneclick = wzry_auto.find_template("oneclick_farm.png", shot)
+        self.assertIsNotNone(refresh, "走到土地上时刷新站位按钮仍在")
+        self.assertIsNone(oneclick, "离开石像后一键务农就不弹了")
+
+    @staticmethod
+    def _walk(reset_first):
+        """跑一遍步骤6，返回 (是否刷新过站位, 推杆调用列表)。"""
+        with contextlib.ExitStack() as stack:
+            reset = stack.enter_context(
+                patch.object(wzry_auto, "reset_position", return_value=True)
+            )
+            move = stack.enter_context(patch.object(wzry_auto, "move_joystick"))
+            stack.enter_context(
+                patch.object(wzry_auto, "in_farm_scene", return_value=True)
+            )
+            stack.enter_context(patch.object(wzry_auto.time, "sleep"))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            wzry_auto.step6_move_to_statue(reset_first=reset_first)
+        return reset.called, move.call_args_list
+
+    def test_first_walk_starts_from_the_platform_without_resetting(self):
+        reset_called, moves = self._walk(reset_first=False)
+        self.assertFalse(reset_called)
+        self.assertEqual(len(moves), 1)
+
+    def test_retry_refreshes_position_before_walking_again(self):
+        reset_called, moves = self._walk(reset_first=True)
+        self.assertTrue(reset_called, "重走前必须先把人拉回石盘")
+        self.assertEqual(len(moves), 1)
+
+    @staticmethod
+    def _farm(hits, nudge=True):
+        """跑一遍步骤7，has_template 依次返回 hits；返回 (成功?, 推杆调用)。"""
+        seen = list(hits)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(wzry_auto, "screenshot"))
+            stack.enter_context(
+                patch.object(wzry_auto, "has_template", side_effect=seen)
+            )
+            stack.enter_context(
+                patch.object(wzry_auto, "click_template", return_value=True)
+            )
+            stack.enter_context(patch.object(wzry_auto, "save_diagnostic"))
+            move = stack.enter_context(patch.object(wzry_auto, "move_joystick"))
+            stack.enter_context(patch.object(wzry_auto.time, "sleep"))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            ok, _ = wzry_auto.step7_oneclick_farm(nudge=nudge)
+        return ok, move.call_args_list
+
+    def test_button_found_at_once_needs_no_nudge(self):
+        ok, moves = self._farm([True])
+        self.assertTrue(ok)
+        self.assertEqual(moves, [])
+
+    def test_a_few_steps_short_is_recovered_by_nudging(self):
+        # 第一眼没弹，补一小步就出来了——这一轮不该白白重启游戏
+        ok, moves = self._farm([False, True])
+        self.assertTrue(ok)
+        self.assertEqual(len(moves), 1)
+
+    def test_nudging_stops_after_the_configured_tries(self):
+        misses = [False] * (1 + len(wzry_auto.STEP7_NUDGE_RATIOS))
+        ok, moves = self._farm(misses)
+        self.assertFalse(ok)
+        self.assertEqual(len(moves), len(wzry_auto.STEP7_NUDGE_RATIOS))
+
+    def test_each_nudge_is_shorter_than_a_full_walk(self):
+        # 补步得是"挪一点"，跟步骤6一样长就等于再走一整段，直接冲过石像
+        full = wzry_auto._step6_cfg["duration"]
+        ok, moves = self._farm([False] * (1 + len(wzry_auto.STEP7_NUDGE_RATIOS)))
+        self.assertFalse(ok)
+        for call in moves:
+            self.assertLess(call.args[2], full)
+
+    def test_second_attempt_after_refresh_does_not_nudge(self):
+        # 刷新站位后已经从石盘完整重走过，再补步只会越补越远
+        ok, moves = self._farm([False], nudge=False)
+        self.assertFalse(ok)
+        self.assertEqual(moves, [])
+
+
+class Step6EnvOverrideTests(unittest.TestCase):
+    """推杆参数可用环境变量微调，不必改代码重新打包。"""
+
+    BASE = {"center": (400, 972), "angle": 120, "distance": 400, "duration": 1500}
+
+    def _tuned(self, **env):
+        with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            return wzry_auto.apply_step6_env_overrides(self.BASE)
+
+    def test_no_env_keeps_resolution_defaults(self):
+        self.assertEqual(self._tuned(), self.BASE)
+
+    def test_longer_hold_walks_further(self):
+        self.assertEqual(self._tuned(WZRY_STEP6_DURATION="1800")["duration"], 1800)
+
+    def test_angle_and_distance_are_tunable(self):
+        tuned = self._tuned(WZRY_STEP6_ANGLE="115", WZRY_STEP6_DISTANCE="450")
+        self.assertEqual((tuned["angle"], tuned["distance"]), (115, 450))
+
+    def test_garbage_and_out_of_range_keep_the_default(self):
+        self.assertEqual(self._tuned(WZRY_STEP6_DURATION="久一点")["duration"], 1500)
+        self.assertEqual(self._tuned(WZRY_STEP6_DURATION="99999")["duration"], 1500)
+        self.assertEqual(self._tuned(WZRY_STEP6_DISTANCE="0")["distance"], 400)
+
+    def test_override_does_not_mutate_the_input(self):
+        self._tuned(WZRY_STEP6_DURATION="1800")
+        self.assertEqual(self.BASE["duration"], 1500)
+
+
 if __name__ == "__main__":
     unittest.main()
