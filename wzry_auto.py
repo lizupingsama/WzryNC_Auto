@@ -44,6 +44,30 @@ CYCLE_FILE = str(ASSETS_DIR / "crop_cycle.json")
 # 等待超过该秒数时熄灭手机屏幕（下一轮开头会自动唤醒解锁）
 SCREEN_OFF_WAIT_SECONDS = 180
 
+# 唤醒提前量（分钟，可带小数）：一轮要先启动游戏、关弹窗、进农场、走到土地
+# 才点得到一键务农，所以必须在浇水/成熟节点之前就唤醒。实测这段耗时中位 1.8
+# 分钟（P10 1.6 / P90 2.6），提前量比它大就会早到——最后一次浇水的减时最少
+# （1 小时档只减 1 分钟），早到几十秒就浇不熟，得多跑一轮才收得上；提前量小
+# 一点最多晚几十秒下手，代价低得多，故默认 1 分钟。图形界面可在下拉框里选，
+# 终端模式用 WZRY_WAKE_LEAD_MIN 指定。
+DEFAULT_WAKE_LEAD_MIN = 1.0
+MAX_WAKE_LEAD_MIN = 10.0
+
+
+def wake_lead_minutes():
+    """唤醒提前量；读 WZRY_WAKE_LEAD_MIN，非法值退回默认，范围限 0~10 分钟。"""
+    raw = (os.environ.get("WZRY_WAKE_LEAD_MIN") or "").strip()
+    if not raw:
+        return DEFAULT_WAKE_LEAD_MIN
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"  ⚠️ WZRY_WAKE_LEAD_MIN 无法识别（{raw}），"
+              f"按默认 {DEFAULT_WAKE_LEAD_MIN:g} 分钟")
+        return DEFAULT_WAKE_LEAD_MIN
+    return min(max(value, 0.0), MAX_WAKE_LEAD_MIN)
+
+
 GAME_PKG = "com.tencent.tmgp.sgame"
 GAME_ACT = f"{GAME_PKG}/com.tencent.tmgp.sgame.SGameActivity"
 
@@ -1644,23 +1668,25 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
         record_next_wake(retry_time, None, "识别失败重试")
         return retry_time
     
-    # 提前2分钟唤醒
-    wake_time -= timedelta(minutes=2)
-    
+    # 提前唤醒，留出"启动游戏→进农场→走到土地→点一键务农"这段时间
+    target_time = wake_time
+    lead_min = wake_lead_minutes()
+    wake_time -= timedelta(minutes=lead_min)
+
     if wake_time <= now:
         print(f"  ⚠️ {reason}时间已到，立即重新启动")
-        record_next_wake(now, wake_time + timedelta(minutes=2), reason, result)
+        record_next_wake(now, target_time, reason, result)
         return now
-    
+
     wait_seconds = int((wake_time - now).total_seconds())
     hours = wait_seconds // 3600
     minutes = (wait_seconds % 3600) // 60
     seconds = wait_seconds % 60
-    
-    print(f"  🎯 目标时间: {(wake_time + timedelta(minutes=2)).strftime('%H:%M:%S')} ({reason})")
-    print(f"  🔔 提前2分钟唤醒: {wake_time.strftime('%m-%d %H:%M:%S')}")
+
+    print(f"  🎯 目标时间: {target_time.strftime('%H:%M:%S')} ({reason})")
+    print(f"  🔔 提前 {lead_min:g} 分钟唤醒: {wake_time.strftime('%m-%d %H:%M:%S')}")
     print(f"  ⏳ 等待 {hours}小时{minutes}分{seconds:02d}秒")
-    record_next_wake(wake_time, wake_time + timedelta(minutes=2), reason, result)
+    record_next_wake(wake_time, target_time, reason, result)
     return wake_time
 # ============================================================
 # 手机端存档（换电脑接力挂机）
@@ -1941,8 +1967,10 @@ def restore_device_archive():
           f"（{reason}，还有 {hours}小时{minutes}分{seconds:02d}秒）")
     if os.environ.get("WZRY_GUI") == "1":
         print("     想马上务农就点「立刻务农」，不必等到这个时刻")
+    # 存档里的唤醒时刻已含写入方的提前量，这里只按本机提前量还原目标时刻展示
     stats.set_next_wake(
-        wake_at, wake_at + timedelta(minutes=2), f"{reason}（接力手机存档）"
+        wake_at, wake_at + timedelta(minutes=wake_lead_minutes()),
+        f"{reason}（接力手机存档）",
     )
     if wait_seconds > SCREEN_OFF_WAIT_SECONDS:
         print("  🌙 等待较长，熄灭手机屏幕")

@@ -295,6 +295,26 @@ class WirelessGuiHelperTests(unittest.TestCase):
             {"1 小时": 60, "8 小时": 480, "16 小时": 960, "32 小时": 1920},
         )
 
+    def test_wake_lead_options_match_core_default(self):
+        values = dict(self.gui_module.WAKE_LEAD_OPTIONS)
+        # 界面默认项必须就是挂机核心的默认提前量，否则两边会各说一套
+        self.assertEqual(
+            values[self.gui_module.WAKE_LEAD_DEFAULT_TEXT],
+            wzry_auto.DEFAULT_WAKE_LEAD_MIN,
+        )
+        self.assertEqual(
+            self.gui_module.WAKE_LEAD_DEFAULT, wzry_auto.DEFAULT_WAKE_LEAD_MIN
+        )
+        for text, minutes in values.items():
+            with self.subTest(option=text):
+                self.assertGreaterEqual(minutes, 0)
+                self.assertLessEqual(minutes, wzry_auto.MAX_WAKE_LEAD_MIN)
+                # 下拉框选项要能原样被核心解析回同一个数
+                with patch.dict(
+                    os.environ, {"WZRY_WAKE_LEAD_MIN": f"{minutes:g}"}
+                ):
+                    self.assertEqual(wzry_auto.wake_lead_minutes(), minutes)
+
     def test_normalize_appends_default_port(self):
         self.assertEqual(
             self.FarmGui._normalize_wireless_addr("192.168.1.5"), "192.168.1.5:5555"
@@ -877,6 +897,67 @@ class DeviceArchiveTests(unittest.TestCase):
         # 无线地址 ip:port 会随路由器重新分配而改变，不能拿来当身份
         with patch.object(wzry_auto, "adb_shell", return_value=f"{self.DEVICE_ID}\n"):
             self.assertEqual(wzry_auto.get_device_id(), self.DEVICE_ID)
+
+
+class WakeLeadTests(unittest.TestCase):
+    """唤醒提前量：留给"启动游戏→进农场→走到土地"这段路的时间，可配置。"""
+
+    @staticmethod
+    def _lead(raw):
+        with patch.dict(os.environ, {"WZRY_WAKE_LEAD_MIN": raw}),              contextlib.redirect_stdout(io.StringIO()):
+            return wzry_auto.wake_lead_minutes()
+
+    def test_default_is_one_minute(self):
+        self.assertEqual(wzry_auto.DEFAULT_WAKE_LEAD_MIN, 1.0)
+        self.assertEqual(self._lead(""), 1.0)
+
+    def test_accepts_fraction_and_zero(self):
+        self.assertEqual(self._lead("1.5"), 1.5)
+        self.assertEqual(self._lead("0"), 0.0)
+
+    def test_out_of_range_is_clamped(self):
+        self.assertEqual(self._lead("-3"), 0.0)
+        self.assertEqual(self._lead("99"), wzry_auto.MAX_WAKE_LEAD_MIN)
+
+    def test_garbage_falls_back_to_default(self):
+        self.assertEqual(self._lead("一分钟"), 1.0)
+
+    @staticmethod
+    def _run_step10(lead, node_min=1):
+        """跑一遍步骤10，返回 (唤醒时刻, 节点时刻, 记录下来的参数)。"""
+        now = datetime.now().replace(microsecond=0)
+        mature = now + timedelta(minutes=30)
+        next_water = mature - timedelta(minutes=node_min)
+        result = {
+            "tier_min": 60, "node_min": node_min,
+            "next_water": next_water, "mature_time": mature,
+        }
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.dict(os.environ, {"WZRY_WAKE_LEAD_MIN": lead})
+            )
+            for name in (
+                "random_screen_fiddle", "adb_shell", "_reapply_low_brightness",
+            ):
+                stack.enter_context(patch.object(wzry_auto, name))
+            record = stack.enter_context(
+                patch.object(wzry_auto, "record_next_wake")
+            )
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            wake = wzry_auto.step10_calculate_wait(result, mature)
+        return wake, next_water, record.call_args[0]
+
+    def test_step10_wakes_ahead_by_configured_lead(self):
+        wake, node_at, recorded = self._run_step10("1.5")
+        self.assertEqual(wake, node_at - timedelta(minutes=1.5))
+        # 面板与手机存档记的是"唤醒时刻 + 未打折的节点时刻"
+        self.assertEqual(recorded[0], wake)
+        self.assertEqual(recorded[1], node_at)
+
+    def test_step10_zero_lead_starts_right_on_the_node(self):
+        wake, node_at, recorded = self._run_step10("0")
+        self.assertEqual(wake, node_at)
+        self.assertEqual(recorded[1], node_at)
 
 
 if __name__ == "__main__":

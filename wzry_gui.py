@@ -76,6 +76,21 @@ CROP_CYCLE_OPTIONS = [
     ("32 小时", 1920),
 ]
 
+# 唤醒提前量：显示文本 -> 分钟数。一轮要先启动游戏、关弹窗、进农场、走到土地
+# 才点得到一键务农，提前量就是留给这段路的时间。选太大反而会早到：最后一次浇水
+# 的减时最少（1 小时档只减 1 分钟），早几十秒就浇不熟，得多跑一轮才收得上。
+# 实测这段耗时中位 1.8 分钟，默认 1 分钟最稳。
+WAKE_LEAD_OPTIONS = [
+    ("不提前", 0.0),
+    ("0.5 分钟", 0.5),
+    ("1 分钟（默认）", 1.0),
+    ("1.5 分钟", 1.5),
+    ("2 分钟", 2.0),
+    ("3 分钟", 3.0),
+]
+WAKE_LEAD_DEFAULT = 1.0
+WAKE_LEAD_DEFAULT_TEXT = WAKE_LEAD_OPTIONS[2][0]
+
 # 外观选项：显示文本 -> customtkinter 外观模式
 APPEARANCE_OPTIONS = [
     ("浅色", "light"),
@@ -422,6 +437,28 @@ class FarmGui:
             command=self._save_config,
         )
         self.device_archive_switch.pack(side="right", padx=14, pady=10)
+
+        # 唤醒提前量：先 pack 的开关在最右，这里再 pack 就落在它左边
+        saved_lead = self.config.get("wake_lead_min", WAKE_LEAD_DEFAULT)
+        try:
+            saved_lead = float(saved_lead)
+        except (TypeError, ValueError):
+            saved_lead = WAKE_LEAD_DEFAULT
+        saved_lead_text = next(
+            (text for text, value in WAKE_LEAD_OPTIONS if value == saved_lead),
+            WAKE_LEAD_DEFAULT_TEXT,
+        )
+        self.wake_lead_var = tk.StringVar(value=saved_lead_text)
+        self.wake_lead_menu = ctk.CTkOptionMenu(
+            crop_opts, values=[text for text, _ in WAKE_LEAD_OPTIONS],
+            variable=self.wake_lead_var, width=124,
+            font=self.font_body, dropdown_font=self.font_body,
+            command=self._save_config,
+        )
+        self.wake_lead_menu.pack(side="right", pady=10)
+        ctk.CTkLabel(crop_opts, text="唤醒提前", font=self.font_body).pack(
+            side="right", padx=(16, 8), pady=10,
+        )
 
         # 设备行：无线地址 + 连接 / USB转无线 / 配对 + 锁屏密码 + 连接状态
         conn = ctk.CTkFrame(self.root, corner_radius=12)
@@ -993,12 +1030,16 @@ class FarmGui:
         crop_cycle_min = dict(CROP_CYCLE_OPTIONS).get(
             self.crop_cycle_var.get(), 480
         )
+        wake_lead_min = dict(WAKE_LEAD_OPTIONS).get(
+            self.wake_lead_var.get(), WAKE_LEAD_DEFAULT
+        )
         env = {
             **os.environ,
             "PYTHONIOENCODING": "utf-8",
             "WZRY_GUI": "1",
             "WZRY_BRIGHTNESS": brightness,
             "WZRY_CROP_CYCLE_MIN": str(crop_cycle_min),
+            "WZRY_WAKE_LEAD_MIN": f"{wake_lead_min:g}",
             # 关掉则忽略手机上的存档，按界面选的档位从第一轮重新务农
             "WZRY_DEVICE_ARCHIVE": "1" if self.device_archive_var.get() else "0",
         }
@@ -1416,6 +1457,7 @@ class FarmGui:
             self.btn_pause.configure(state="disabled", fg_color=DISABLED_BTN)
         self.brightness_menu.configure(state="disabled" if running else "normal")
         self.crop_cycle_menu.configure(state="disabled" if running else "normal")
+        self.wake_lead_menu.configure(state="disabled" if running else "normal")
         self.device_archive_switch.configure(
             state="disabled" if running else "normal"
         )
@@ -1800,6 +1842,9 @@ class FarmGui:
             "brightness": dict(BRIGHTNESS_OPTIONS).get(self.brightness_var.get(), "N"),
             "crop_cycle_min": dict(CROP_CYCLE_OPTIONS).get(
                 self.crop_cycle_var.get(), 480
+            ),
+            "wake_lead_min": dict(WAKE_LEAD_OPTIONS).get(
+                self.wake_lead_var.get(), WAKE_LEAD_DEFAULT
             ),
             "use_device_archive": bool(self.device_archive_var.get()),
             "auto_start": bool(self.auto_start_var.get()),
