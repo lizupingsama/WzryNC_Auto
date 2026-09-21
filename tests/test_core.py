@@ -705,5 +705,179 @@ class KeepAwakeTests(unittest.TestCase):
             self.assertFalse(wzry_auto.keep_system_awake())
 
 
+class DeviceArchiveTests(unittest.TestCase):
+    """手机端存档：换电脑接力挂机，不再一连上设备就先白浇一次水。"""
+
+    DEVICE_ID = "fef7b108fd526415"
+
+    def setUp(self):
+        # 存档相关的全局量与真实的统计/周期文件都要隔离，测试不能动用户数据
+        for name, value in (
+            ("DEVICE", "192.168.1.10:5555"),
+            ("DEVICE_ID", self.DEVICE_ID),
+            ("_archive_tier_min", None),
+        ):
+            patcher = patch.object(wzry_auto, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in ("save_crop_cycle", "adb_input"):
+            patcher = patch.object(wzry_auto, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        tracker = patch.object(wzry_auto, "stats")
+        self.stats = tracker.start()
+        self.stats.rounds = 7
+        self.addCleanup(tracker.stop)
+        env = patch.dict(os.environ, {"WZRY_DEVICE_ARCHIVE": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    @staticmethod
+    def _archive(**overrides):
+        data = {
+            "schema": 1,
+            "device_id": DeviceArchiveTests.DEVICE_ID,
+            "host": "OTHER-PC",
+            "tier_min": 960,
+            "reason": "浇水",
+            # 故意写一个早就过期的本机时间串：唤醒时刻应以手机时钟为准
+            "wake_time": "2000-01-01 00:00:00",
+            "wake_device_epoch": 1_758_403_600,
+            "updated": "2026-09-21 09:00:00",
+            "updated_device_epoch": 1_758_400_000,
+        }
+        data.update(overrides)
+        return data
+
+    def test_archive_write_carries_next_water_and_tier(self):
+        wake = datetime.now() + timedelta(hours=2)
+        result = {
+            "tier_min": 480,
+            "next_water": wake + timedelta(minutes=2),
+            "mature_time": wake + timedelta(hours=1),
+        }
+        with patch.object(wzry_auto, "_device_epoch", return_value=1_758_400_000), \
+             patch("wzry_auto.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
+            self.assertTrue(
+                wzry_auto.save_device_archive(
+                    wake, wake + timedelta(minutes=2), "浇水", result
+                )
+            )
+
+        argv, kwargs = run.call_args
+        payload = json.loads(kwargs["input"].decode("utf-8"))
+        self.assertEqual(payload["device_id"], self.DEVICE_ID)
+        self.assertEqual(payload["tier_min"], 480)
+        self.assertEqual(
+            payload["next_water"],
+            (wake + timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        # 唤醒时刻换算到手机时钟上，换台电脑读回来不受两边系统时钟偏差影响
+        self.assertAlmostEqual(
+            payload["wake_device_epoch"], 1_758_400_000 + 7200, delta=2
+        )
+        # 回归：platform-tools 35+ 在含中文的本地路径下 pull/push 会失败，
+        # 存档读写必须全程不碰本地文件（同 screenshot 的处理）
+        self.assertNotIn("push", argv[0])
+        self.assertNotIn("pull", argv[0])
+        # 原子写：先落临时名再改名，中途断连不会留下半截存档
+        self.assertIn("cat > ", argv[0][-1])
+        self.assertIn("mv -f", argv[0][-1])
+
+    def test_missing_archive_starts_fresh(self):
+        # 文件不存在时设备端报错会并进 stdout 且退出码为 0，只能按内容判断
+        missing = b"cat: /sdcard/wzry_farm/state.json: No such file or directory\n"
+        with patch.object(wzry_auto, "_read_device_file", return_value=missing):
+            self.assertIsNone(wzry_auto.load_device_archive())
+            with patch.object(wzry_auto, "wait_or_farm_now") as wait:
+                self.assertFalse(wzry_auto.restore_device_archive())
+        wait.assert_not_called()
+
+    def test_restore_waits_until_archived_water_time(self):
+        with patch.object(
+                 wzry_auto, "load_device_archive", return_value=self._archive()
+             ), \
+             patch.object(wzry_auto, "_device_epoch", return_value=1_758_400_000), \
+             patch.object(wzry_auto, "wait_or_farm_now") as wait:
+            self.assertTrue(wzry_auto.restore_device_archive())
+
+        # 手机时钟距唤醒点还有 3600 秒，就等 3600 秒，而不是按过期的时间串立刻开干
+        self.assertAlmostEqual(wait.call_args[0][0], 3600, delta=2)
+        self.assertEqual(wzry_auto._archive_tier_min, 960)
+        self.assertIn("浇水", self.stats.set_next_wake.call_args[0][2])
+
+    def test_restore_falls_back_to_written_time_without_phone_clock(self):
+        wake = datetime.now() + timedelta(minutes=30)
+        archive = self._archive(
+            wake_time=wake.strftime("%Y-%m-%d %H:%M:%S"),
+            wake_device_epoch=None,
+        )
+        with patch.object(wzry_auto, "load_device_archive", return_value=archive), \
+             patch.object(wzry_auto, "_device_epoch", return_value=None), \
+             patch.object(wzry_auto, "wait_or_farm_now") as wait:
+            self.assertTrue(wzry_auto.restore_device_archive())
+        self.assertAlmostEqual(wait.call_args[0][0], 1800, delta=2)
+
+    def test_expired_archive_farms_immediately(self):
+        archive = self._archive(wake_device_epoch=1_758_390_000)
+        with patch.object(wzry_auto, "load_device_archive", return_value=archive), \
+             patch.object(wzry_auto, "_device_epoch", return_value=1_758_400_000), \
+             patch.object(wzry_auto, "wait_or_farm_now") as wait:
+            self.assertFalse(wzry_auto.restore_device_archive())
+        wait.assert_not_called()
+        # 档位仍按存档恢复，立刻务农的这一轮也不会用错节点
+        self.assertEqual(wzry_auto._archive_tier_min, 960)
+
+    def test_long_expired_archive_is_ignored_entirely(self):
+        # 关掉开关挂了几天、或中途手动收过菜，陈年存档的档位不能再覆盖界面选择
+        archive = self._archive(wake_device_epoch=1_758_400_000 - 25 * 3600)
+        with patch.object(wzry_auto, "load_device_archive", return_value=archive), \
+             patch.object(wzry_auto, "_device_epoch", return_value=1_758_400_000), \
+             patch.object(wzry_auto, "wait_or_farm_now") as wait:
+            self.assertFalse(wzry_auto.restore_device_archive())
+        wait.assert_not_called()
+        self.assertIsNone(wzry_auto._archive_tier_min)
+
+    def test_archive_of_another_phone_is_ignored(self):
+        archive = self._archive(device_id="0123456789abcdef")
+        with patch.object(wzry_auto, "load_device_archive", return_value=archive), \
+             patch.object(wzry_auto, "wait_or_farm_now") as wait:
+            self.assertFalse(wzry_auto.restore_device_archive())
+        wait.assert_not_called()
+        self.assertIsNone(wzry_auto._archive_tier_min)
+
+    def test_switch_off_skips_archive_entirely(self):
+        with patch.dict(os.environ, {"WZRY_DEVICE_ARCHIVE": "0"}), \
+             patch.object(wzry_auto, "load_device_archive") as load, \
+             patch.object(wzry_auto, "_write_device_file") as write:
+            self.assertFalse(wzry_auto.restore_device_archive())
+            self.assertFalse(
+                wzry_auto.save_device_archive(datetime.now(), None, "浇水")
+            )
+        load.assert_not_called()
+        write.assert_not_called()
+
+    def test_archived_tier_beats_gui_selection(self):
+        # 换电脑接力时，新电脑界面上残留的默认 8 小时档不能把 16 小时作物带偏
+        now = datetime(2026, 8, 26, 10, 0, 0)
+        with patch.object(wzry_auto, "_archive_tier_min", 960), \
+             patch.dict(os.environ, {"WZRY_CROP_CYCLE_MIN": "480"}):
+            result = wzry_auto.calculate_next_water_time(
+                now + timedelta(minutes=480), now=now
+            )
+        self.assertEqual(result["tier_min"], 960)
+        self.assertEqual(result["node_min"], 160)
+
+    def test_device_id_falls_back_to_serial_number(self):
+        with patch.object(wzry_auto, "adb_shell", side_effect=["null\n", "YP9TU\n"]):
+            self.assertEqual(wzry_auto.get_device_id(), "YP9TU")
+
+    def test_device_id_prefers_android_id_over_wireless_address(self):
+        # 无线地址 ip:port 会随路由器重新分配而改变，不能拿来当身份
+        with patch.object(wzry_auto, "adb_shell", return_value=f"{self.DEVICE_ID}\n"):
+            self.assertEqual(wzry_auto.get_device_id(), self.DEVICE_ID)
+
+
 if __name__ == "__main__":
     unittest.main()

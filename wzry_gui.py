@@ -410,6 +410,19 @@ class FarmGui:
             font=self.font_small, text_color=MUTED,
         ).pack(side="left", padx=(12, 0), pady=10)
 
+        # 挂机进度（下次浇水时间 + 作物档位）写在手机自己身上，换台电脑连上
+        # 同一部手机就接着等下一个浇水节点，而不是一连上就先白浇一次水。
+        # 关掉则忽略手机存档，按界面选的档位从头务农。
+        self.device_archive_var = tk.BooleanVar(
+            value=bool(self.config.get("use_device_archive", True))
+        )
+        self.device_archive_switch = ctk.CTkSwitch(
+            crop_opts, text="手机存档接力", variable=self.device_archive_var,
+            onvalue=True, offvalue=False, font=self.font_body,
+            command=self._save_config,
+        )
+        self.device_archive_switch.pack(side="right", padx=14, pady=10)
+
         # 设备行：无线地址 + 连接 / USB转无线 / 配对 + 锁屏密码 + 连接状态
         conn = ctk.CTkFrame(self.root, corner_radius=12)
         conn.pack(fill="x", padx=pad, pady=(0, 8))
@@ -986,6 +999,8 @@ class FarmGui:
             "WZRY_GUI": "1",
             "WZRY_BRIGHTNESS": brightness,
             "WZRY_CROP_CYCLE_MIN": str(crop_cycle_min),
+            # 关掉则忽略手机上的存档，按界面选的档位从第一轮重新务农
+            "WZRY_DEVICE_ARCHIVE": "1" if self.device_archive_var.get() else "0",
         }
         wireless = self._normalize_wireless_addr(self.device_entry.get())
         if wireless:
@@ -1401,6 +1416,9 @@ class FarmGui:
             self.btn_pause.configure(state="disabled", fg_color=DISABLED_BTN)
         self.brightness_menu.configure(state="disabled" if running else "normal")
         self.crop_cycle_menu.configure(state="disabled" if running else "normal")
+        self.device_archive_switch.configure(
+            state="disabled" if running else "normal"
+        )
         self._refresh_adb_controls()
         self._refresh_tray()
 
@@ -1783,6 +1801,7 @@ class FarmGui:
             "crop_cycle_min": dict(CROP_CYCLE_OPTIONS).get(
                 self.crop_cycle_var.get(), 480
             ),
+            "use_device_archive": bool(self.device_archive_var.get()),
             "auto_start": bool(self.auto_start_var.get()),
             "start_minimized": bool(self.start_min_var.get()),
             "auto_restart": bool(self.auto_restart_var.get()),

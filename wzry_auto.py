@@ -470,8 +470,14 @@ def calculate_next_water_time(
     print(f"  💧 当前剩余成熟时间:{remain_min:.1f} 分钟")
 
     selected_cycle = cycle_min
+    source = "指定档位"
+    if selected_cycle is None and _archive_tier_min is not None:
+        # 手机存档优先于界面选择：换电脑接力时，别被新电脑界面上的默认档位带偏
+        selected_cycle = _archive_tier_min
+        source = "手机存档档位"
     if selected_cycle is None:
         selected_cycle = os.environ.get("WZRY_CROP_CYCLE_MIN")
+        source = "界面选择档位"
     try:
         selected_cycle = int(selected_cycle) if selected_cycle is not None else None
     except (TypeError, ValueError):
@@ -479,7 +485,7 @@ def calculate_next_water_time(
 
     if selected_cycle in WATER_PLANS:
         tier_min = selected_cycle
-        print(f"  🌱 使用界面选择档位:{tier_min // 60} 小时档")
+        print(f"  🌱 使用{source}:{tier_min // 60} 小时档")
     else:
         tier_min = None if save_if_fresh else load_crop_cycle()
         if tier_min is None or remain_min > tier_min:
@@ -1600,7 +1606,7 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
         random_screen_fiddle()
         adb_shell(f"am force-stop {GAME_PKG}")
         _reapply_low_brightness()
-        stats.set_next_wake(datetime.now(), None, "作物已成熟，立即收割")
+        record_next_wake(datetime.now(), None, "作物已成熟，立即收割")
         time.sleep(1)
         return None
     
@@ -1635,7 +1641,7 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
     else:
         print("  ⚠️ 无法识别时间，5分钟后重试...")
         retry_time = now + timedelta(minutes=5)
-        stats.set_next_wake(retry_time, None, "识别失败重试")
+        record_next_wake(retry_time, None, "识别失败重试")
         return retry_time
     
     # 提前2分钟唤醒
@@ -1643,7 +1649,7 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
     
     if wake_time <= now:
         print(f"  ⚠️ {reason}时间已到，立即重新启动")
-        stats.set_next_wake(now, wake_time + timedelta(minutes=2), reason)
+        record_next_wake(now, wake_time + timedelta(minutes=2), reason, result)
         return now
     
     wait_seconds = int((wake_time - now).total_seconds())
@@ -1654,8 +1660,296 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
     print(f"  🎯 目标时间: {(wake_time + timedelta(minutes=2)).strftime('%H:%M:%S')} ({reason})")
     print(f"  🔔 提前2分钟唤醒: {wake_time.strftime('%m-%d %H:%M:%S')}")
     print(f"  ⏳ 等待 {hours}小时{minutes}分{seconds:02d}秒")
-    stats.set_next_wake(wake_time, wake_time + timedelta(minutes=2), reason)
+    record_next_wake(wake_time, wake_time + timedelta(minutes=2), reason, result)
     return wake_time
+# ============================================================
+# 手机端存档（换电脑接力挂机）
+# ============================================================
+# 挂机进度原本只存在电脑本地：换一台电脑启动就从第一轮开始，一连上手机
+# 立刻浇一次水，而那个时刻往往不是该浇的节点，白白废掉一次减时。存档跟着
+# 手机走——每轮算出唤醒时间后，连同作物档位写回手机；另一台电脑连上同一
+# 台手机时先读存档，等到存档里的时间点再动手，手机上没有存档才从头务农。
+#
+# 不走 adb pull/push：platform-tools 35+ 在含中文的本地路径下会失败，而
+# 打包目录正是「王者农场助手」（同 screenshot 的注释）。改用 exec-out cat
+# 读、shell "cat > 临时名 && mv" 原子写，全程不落地本地文件。
+DEVICE_ARCHIVE_DIR = "/sdcard/wzry_farm"
+DEVICE_ARCHIVE_FILE = f"{DEVICE_ARCHIVE_DIR}/state.json"
+ARCHIVE_SCHEMA = 1
+ARCHIVE_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+# 唤醒时刻早于现在这么久的存档整份作废（连档位一起）：正常接力里最长的
+# 一次等待是 32 小时档等成熟的 23.5 小时，落到 24 小时外只可能是陈年残留
+ARCHIVE_STALE_SECONDS = 24 * 3600
+
+DEVICE_ID = ""            # 手机唯一识别码，存档按它归属
+_archive_tier_min = None  # 从存档恢复出的作物档位，本次会话内优先于界面选择
+
+
+def archive_enabled():
+    """助手里关掉「手机存档接力」(WZRY_DEVICE_ARCHIVE=0) 时完全不碰存档。"""
+    return os.environ.get("WZRY_DEVICE_ARCHIVE", "1") != "0"
+
+
+def get_device_id():
+    """读手机唯一识别码：android_id 优先，退化到序列号，再退化到 adb 地址。
+
+    无线调试地址 ip:port 会随路由器重新分配而改变，不能拿来当身份；
+    android_id 只要不恢复出厂设置就保持不变，换台电脑连同一台手机也能
+    稳定对上同一份存档。
+    """
+    for cmd, label in (
+        ("settings get secure android_id", "android_id"),
+        ("getprop ro.serialno", "序列号"),
+    ):
+        try:
+            value = (adb_shell(cmd) or "").strip()
+        except (OSError, subprocess.TimeoutExpired):
+            value = ""
+        if value and value.lower() not in ("null", "unknown"):
+            print(f"  🆔 手机识别码({label}): {value}")
+            return value
+    print(f"  ⚠️ 读不到手机识别码，退化使用 adb 地址: {DEVICE}")
+    return DEVICE
+
+
+def _device_epoch():
+    """手机自己的当前时间戳（秒）；读不到返回 None。
+
+    两台电脑的系统时钟可能差上几分钟，直接搬绝对时间会把浇水点带偏。
+    以手机时钟为参照系记录唤醒时刻，换到哪台电脑都指向同一个真实时刻。
+    """
+    try:
+        out = (adb_shell("date +%s") or "").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return int(out.split()[-1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_device_file(remote):
+    """读手机上的文件，返回原始字节；读不到返回 None。"""
+    try:
+        result = subprocess.run(
+            [ADB, "-s", DEVICE, "exec-out", "cat", remote],
+            capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout or b""
+
+
+def _write_device_file(remote, data):
+    """原子写手机文件：先写同目录临时名再 mv，中途断连不会留下半截存档。"""
+    tmp = f"{remote}.tmp"
+    cmd = f"mkdir -p {DEVICE_ARCHIVE_DIR} && cat > {tmp} && mv -f {tmp} {remote}"
+    try:
+        result = subprocess.run(
+            [ADB, "-s", DEVICE, "shell", cmd],
+            input=data, capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"  ⚠️ 写入手机存档失败: {exc}")
+        return False
+    noise = (result.stdout + result.stderr).decode("utf-8", "replace").strip()
+    if result.returncode != 0 or noise:
+        print(f"  ⚠️ 写入手机存档失败: {noise or f'adb 返回 {result.returncode}'}")
+        return False
+    return True
+
+
+def load_device_archive():
+    """读手机上的挂机存档；没有存档、内容损坏或读失败都返回 None。
+
+    exec-out 会把设备端的 stderr 并进 stdout 且退出码始终为 0，
+    因此只能按内容判断：开头不是 JSON 就当没有存档。
+    """
+    raw = _read_device_file(DEVICE_ARCHIVE_FILE)
+    if not raw:
+        return None
+    text = raw.decode("utf-8", "replace").strip()
+    if not text.startswith("{"):
+        if "No such file" not in text:
+            print(f"  ⚠️ 读取手机存档失败: {text.splitlines()[0][:120]}")
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        print("  ⚠️ 手机存档内容损坏，按全新务农处理")
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def current_tier_min():
+    """本次会话实际在用的作物档位：存档 > 界面选择 > 本地记录。"""
+    for value in (_archive_tier_min, os.environ.get("WZRY_CROP_CYCLE_MIN")):
+        try:
+            tier = int(value) if value else None
+        except (TypeError, ValueError):
+            tier = None
+        if tier in WATER_PLANS:
+            return tier
+    return load_crop_cycle()
+
+
+def save_device_archive(wake_time, target_time=None, reason="", result=None):
+    """把下次浇水时间与当前作物档位写回手机，供另一台电脑接力。"""
+    if not archive_enabled() or not DEVICE_ID:
+        return False
+
+    tier_min = (result or {}).get("tier_min")
+    if tier_min not in WATER_PLANS:
+        tier_min = current_tier_min()
+    next_water = (result or {}).get("next_water")
+    mature_time = (result or {}).get("mature_time")
+
+    now = datetime.now()
+    device_now = _device_epoch()
+
+    def _text(value):
+        return value.strftime(ARCHIVE_TIME_FMT) if value else None
+
+    payload = {
+        "schema": ARCHIVE_SCHEMA,
+        "device_id": DEVICE_ID,
+        "serial": DEVICE,
+        "host": socket.gethostname(),
+        "tier_min": tier_min,
+        "reason": reason,
+        "wake_time": _text(wake_time),
+        "target_time": _text(target_time),
+        "next_water": _text(next_water),
+        "mature_time": _text(mature_time),
+        # 以手机时钟计的唤醒时刻，免受两台电脑时钟偏差影响
+        "wake_device_epoch": (
+            device_now + int((wake_time - now).total_seconds())
+            if device_now and wake_time else None
+        ),
+        "updated": now.strftime(ARCHIVE_TIME_FMT),
+        "updated_device_epoch": device_now,
+        "rounds": stats.rounds,
+    }
+    # 单行 JSON：不留换行，彻底避开 adb 通道可能的换行转换
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if not _write_device_file(DEVICE_ARCHIVE_FILE, data):
+        return False
+    tier_text = f"{tier_min // 60} 小时档" if tier_min in WATER_PLANS else "未知档位"
+    print(f"  ☁️ 已写入手机存档: {_text(wake_time) or '待定'} "
+          f"{reason or '唤醒'}（{tier_text}）")
+    return True
+
+
+def record_next_wake(wake_time, target_time=None, reason="", result=None):
+    """记下一轮唤醒时间：本地统计面板 + 手机存档（换电脑接力用）。"""
+    stats.set_next_wake(wake_time, target_time, reason)
+    save_device_archive(wake_time, target_time, reason, result)
+
+
+def _archive_wake_time(data):
+    """把存档里的唤醒时刻换算成本机时间；换算不出返回 None。
+
+    优先用手机时钟记的 wake_device_epoch 抵消两台电脑的时钟偏差，
+    手机时间读不到时才退回写入方的本地时间字符串。
+    """
+    epoch = data.get("wake_device_epoch")
+    if isinstance(epoch, int):
+        device_now = _device_epoch()
+        if device_now:
+            return datetime.now() + timedelta(seconds=epoch - device_now)
+    try:
+        return datetime.strptime(data.get("wake_time"), ARCHIVE_TIME_FMT)
+    except (TypeError, ValueError):
+        return None
+
+
+def _note_previous_host(data):
+    """存档是别的电脑写的就提醒一句：同一台手机被两台电脑同时挂会互相打断。
+
+    不按"多久之前写的"判断对方是否还活着：一轮写一次存档，8 小时档两次
+    写入隔着好几个钟头，真有人在挂也测不出来，反倒会在正常换机时误报。
+    """
+    host = data.get("host") or ""
+    if host and host != socket.gethostname():
+        print(f"     若「{host}」那台电脑仍在挂机，请先停掉（两边同时挂会互相打断）")
+
+
+def restore_device_archive():
+    """启动时按手机存档接力：命中就等到存档里的唤醒时刻再开始第一轮。
+
+    :return: True 表示已按存档等待过（含被「立刻务农」打断），
+             False 表示没有可用存档，照常立即开始务农
+    """
+    global _archive_tier_min
+
+    if not archive_enabled():
+        print("  ☁️ 已关闭手机存档接力，按全新务农开始")
+        return False
+
+    data = load_device_archive()
+    if not data:
+        print("  ☁️ 手机上没有挂机存档，按全新务农开始")
+        return False
+
+    saved_id = str(data.get("device_id") or "")
+    if saved_id and DEVICE_ID and saved_id != DEVICE_ID:
+        print(f"  ⚠️ 存档属于另一台手机({saved_id})，忽略并按全新务农开始")
+        return False
+
+    print(f"  ☁️ 读到手机存档：{data.get('host') or '未知电脑'} 于 "
+          f"{data.get('updated') or '未知时间'} 写入")
+    _note_previous_host(data)
+
+    wake_at = _archive_wake_time(data)
+    if wake_at is None:
+        print("  ⚠️ 存档里没有可用的唤醒时间，忽略并按全新务农开始")
+        return False
+
+    reason = data.get("reason") or "唤醒"
+    wait_seconds = int((wake_at - datetime.now()).total_seconds())
+    # 过期太久的存档连档位也不能信：那株作物多半早被收掉或换种了，
+    # 32 小时档等成熟最长也就 23.5 小时，正常接力绝不会掉进这个门槛
+    if wait_seconds < -ARCHIVE_STALE_SECONDS:
+        stale_hours = -wait_seconds // 3600
+        print(f"  ⚠️ 存档已过期 {stale_hours} 小时（早于任何一次正常等待），"
+              "忽略并按全新务农开始")
+        return False
+
+    tier_min = data.get("tier_min")
+    if tier_min in WATER_PLANS:
+        _archive_tier_min = tier_min
+        save_crop_cycle(tier_min)
+        print(f"  🌱 按存档恢复作物档位:{tier_min // 60} 小时档")
+        chosen = os.environ.get("WZRY_CROP_CYCLE_MIN")
+        try:
+            chosen = int(chosen) if chosen else None
+        except ValueError:
+            chosen = None
+        if chosen in WATER_PLANS and chosen != tier_min:
+            print(f"     界面选的 {chosen // 60} 小时档本次不生效（存档优先）；"
+                  "要按界面重新开始请关掉「手机存档接力」")
+
+    if wait_seconds <= 0:
+        print(f"  ⏰ 存档里的「{reason}」时间已过，立即开始务农")
+        return False
+
+    hours, remainder = divmod(wait_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"  🤝 接力存档：等到 {wake_at.strftime('%m-%d %H:%M:%S')} 再动手"
+          f"（{reason}，还有 {hours}小时{minutes}分{seconds:02d}秒）")
+    if os.environ.get("WZRY_GUI") == "1":
+        print("     想马上务农就点「立刻务农」，不必等到这个时刻")
+    stats.set_next_wake(
+        wake_at, wake_at + timedelta(minutes=2), f"{reason}（接力手机存档）"
+    )
+    if wait_seconds > SCREEN_OFF_WAIT_SECONDS:
+        print("  🌙 等待较长，熄灭手机屏幕")
+        adb_input("input keyevent KEYCODE_SLEEP")
+    wait_or_farm_now(wait_seconds)
+    return True
+
 # ============================================================
 # 主流程
 # ============================================================
@@ -1842,7 +2136,13 @@ def main():
             "duration": 1500,
         }
         print(f"  🎯 步骤6使用缩放配置: {_step6_cfg}")
-    
+
+    # 记下这台手机的唯一识别码，并尝试接力手机上的存档：读到存档就等到
+    # 存档里的浇水节点再动手，不再一连上设备就先白浇一次水
+    global DEVICE_ID
+    DEVICE_ID = get_device_id()
+    restore_device_archive()
+
     round_num = stats.rounds  # 接续历史轮次编号
     while True:
         # 作废竞态窗口（等待刚结束、新一轮将启）漏进来的立刻务农指令，
