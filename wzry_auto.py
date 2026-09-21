@@ -44,6 +44,11 @@ CYCLE_FILE = str(ASSETS_DIR / "crop_cycle.json")
 # 等待超过该秒数时熄灭手机屏幕（下一轮开头会自动唤醒解锁）
 SCREEN_OFF_WAIT_SECONDS = 180
 
+# 失败现场保留上限。一次通宵失败循环能写出几百个现场：2026-08-26 那晚
+# 505 个 step2_launch 就占了 3 GB（每个现场含一张 3200x1440 截图约 5 MB），
+# 必须封顶。
+MAX_DIAGNOSTIC_DIRS = 50
+
 # 唤醒提前量（分钟，可带小数）：一轮要先启动游戏、关弹窗、进农场、走到土地
 # 才点得到一键务农，所以必须在浇水/成熟节点之前就唤醒。实测这段耗时中位 1.8
 # 分钟（P10 1.6 / P90 2.6），提前量比它大就会早到——最后一次浇水的减时最少
@@ -1068,8 +1073,52 @@ def wait_for_any_template(template_names, timeout=60, interval=1, label="页面"
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
     return None
 
+# 现场目录名形如 20260825_134718_step7_oneclick，步骤名在时间戳之后
+_DIAGNOSTIC_NAME = re.compile(r"^\d{8}_\d{6}_(?P<step>.+)$")
+
+
+def prune_diagnostics(limit=None):
+    """把失败现场压到上限内，返回删掉的目录数。
+
+    删谁有讲究：总是从**当前数量最多**的那一类里挑最旧的删，而不是一律删
+    全局最旧的。因为失败往往是一类故障连着炸几百次，全局最旧那套规则会让
+    这类洪水把其他类型仅有的一两个现场挤掉——2026-09-21 定位步骤7那个 bug，
+    靠的正是被 505 个 step2_launch 埋着的 5 个 step7_oneclick。
+    名字不符合现场命名规则的目录当作人手放的，一概不碰。
+    """
+    limit = MAX_DIAGNOSTIC_DIRS if limit is None else limit
+    root = SCRIPT_DIR / "diagnostics"
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return 0
+
+    groups = {}
+    for entry in entries:
+        matched = _DIAGNOSTIC_NAME.match(entry.name)
+        if matched and entry.is_dir():
+            groups.setdefault(matched.group("step"), []).append(entry)
+
+    # entries 已按名字排序，同类里靠前的就是最旧的
+    total = sum(len(dirs) for dirs in groups.values())
+    removed = 0
+    while total > limit and groups:
+        step = max(groups, key=lambda name: (len(groups[name]), name))
+        oldest = groups[step].pop(0)
+        if not groups[step]:
+            del groups[step]
+        total -= 1
+        try:
+            shutil.rmtree(oldest)
+            removed += 1
+        except OSError as exc:
+            # 截图被看图软件占着之类，跳过即可，下次失败再清
+            print(f"  ⚠️ 清理失败现场 {oldest.name} 失败: {exc}")
+    return removed
+
+
 def save_diagnostic(step, details=None):
-    """保存失败现场，供游戏更新后离线复现。"""
+    """保存失败现场，供游戏更新后离线复现；顺手把总数压回上限内。"""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = SCRIPT_DIR / "diagnostics" / f"{stamp}_{step}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1084,6 +1133,13 @@ def save_diagnostic(step, details=None):
     with open(output_dir / "context.json", "w", encoding="utf-8") as file:
         json.dump(context, file, ensure_ascii=False, indent=2)
     print(f"  📁 已保存失败现场: {output_dir}")
+    try:
+        removed = prune_diagnostics()
+    except Exception as exc:  # 清理再怎么出错也不该拖垮挂机
+        print(f"  ⚠️ 清理失败现场出错（不影响挂机）: {exc}")
+        removed = 0
+    if removed:
+        print(f"  🧹 现场超过 {MAX_DIAGNOSTIC_DIRS} 个，已清掉最旧的 {removed} 个")
     return output_dir
 
 # ============================================================

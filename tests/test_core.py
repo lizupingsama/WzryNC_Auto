@@ -1080,5 +1080,94 @@ class Step6EnvOverrideTests(unittest.TestCase):
         self.assertEqual(self.BASE["duration"], 1500)
 
 
+class DiagnosticRetentionTests(unittest.TestCase):
+    """失败现场保留上限：一夜失败循环不该把盘写满，也不该冲掉稀有现场。"""
+
+    @staticmethod
+    def _make(root, names):
+        """在临时 diagnostics 下造出这些现场目录。"""
+        folder = root / "diagnostics"
+        folder.mkdir(exist_ok=True)
+        for name in names:
+            (folder / name).mkdir()
+        return folder
+
+    @staticmethod
+    def _stamped(step, count, day="20260826"):
+        """同一步骤的连号现场，名字里的时间戳即新旧顺序。"""
+        return [f"{day}_{10000 + i:06d}_{step}" for i in range(count)]
+
+    @contextlib.contextmanager
+    def _sandbox(self, names):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = self._make(root, names)
+            with patch.object(wzry_auto, "SCRIPT_DIR", root), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                yield folder
+
+    def test_under_the_cap_nothing_is_removed(self):
+        names = self._stamped("step2_launch", 10)
+        with self._sandbox(names) as folder:
+            self.assertEqual(wzry_auto.prune_diagnostics(), 0)
+            self.assertEqual(len(list(folder.iterdir())), 10)
+
+    def test_over_the_cap_is_trimmed_back_to_it(self):
+        names = self._stamped("step2_launch", wzry_auto.MAX_DIAGNOSTIC_DIRS + 7)
+        with self._sandbox(names) as folder:
+            self.assertEqual(wzry_auto.prune_diagnostics(), 7)
+            self.assertEqual(
+                len(list(folder.iterdir())), wzry_auto.MAX_DIAGNOSTIC_DIRS
+            )
+
+    def test_a_flood_of_one_step_cannot_evict_the_rare_ones(self):
+        # 2026-09-21 定位步骤7的 bug 靠的就是被 505 个 step2_launch 埋着的
+        # 5 个 step7_oneclick；一律删全局最旧会把它们先冲掉
+        rare = self._stamped("step7_oneclick", 5, day="20260825")
+        flood = self._stamped("step2_launch", 505, day="20260826")
+        with self._sandbox(rare + flood) as folder:
+            wzry_auto.prune_diagnostics()
+            left = sorted(p.name for p in folder.iterdir())
+        self.assertTrue(set(rare).issubset(left), "稀有现场必须留住")
+        self.assertEqual(len(left), wzry_auto.MAX_DIAGNOSTIC_DIRS)
+
+    def test_within_a_step_the_oldest_go_first(self):
+        names = self._stamped("step2_launch", wzry_auto.MAX_DIAGNOSTIC_DIRS + 3)
+        with self._sandbox(names) as folder:
+            wzry_auto.prune_diagnostics()
+            left = sorted(p.name for p in folder.iterdir())
+        self.assertEqual(left, names[3:])
+
+    def test_hand_made_folders_are_left_alone(self):
+        names = self._stamped("step2_launch", wzry_auto.MAX_DIAGNOSTIC_DIRS + 5)
+        with self._sandbox(names + ["我自己放的参考图"]) as folder:
+            wzry_auto.prune_diagnostics()
+            left = sorted(p.name for p in folder.iterdir())
+        self.assertIn("我自己放的参考图", left)
+        # 上限只管现场目录，人手目录不占额度
+        self.assertEqual(len(left), wzry_auto.MAX_DIAGNOSTIC_DIRS + 1)
+
+    def test_undeletable_folder_does_not_break_the_run(self):
+        names = self._stamped("step2_launch", wzry_auto.MAX_DIAGNOSTIC_DIRS + 2)
+        with self._sandbox(names):
+            with patch.object(
+                wzry_auto.shutil, "rmtree", side_effect=OSError("被占用")
+            ):
+                self.assertEqual(wzry_auto.prune_diagnostics(), 0)
+
+    def test_saving_a_capture_also_trims(self):
+        names = self._stamped("step2_launch", wzry_auto.MAX_DIAGNOSTIC_DIRS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = self._make(root, names)
+            with patch.object(wzry_auto, "SCRIPT_DIR", root), \
+                 patch.object(wzry_auto, "SCREENSHOT_PATH", str(root / "none.png")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                fresh = wzry_auto.save_diagnostic("step7_oneclick")
+            left = sorted(p.name for p in folder.iterdir())
+        self.assertEqual(len(left), wzry_auto.MAX_DIAGNOSTIC_DIRS)
+        self.assertIn(fresh.name, left, "刚存的现场不能被自己挤掉")
+
+
 if __name__ == "__main__":
     unittest.main()
