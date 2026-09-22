@@ -73,6 +73,33 @@ def wake_lead_minutes():
     return min(max(value, 0.0), MAX_WAKE_LEAD_MIN)
 
 
+# 原地短等门槛（分钟）：节点近在眼前时不退游戏。退出去重来要两分多钟（启动
+# →登录→关弹窗→进农场→走到石像），差一两分钟就到的节点必然晚到；1 小时档
+# 尤其吃亏——最后一次浇水后离成熟只剩 1 分钟，每个周期都要为这 1 分钟白重启
+# 一次游戏。门槛内改为留在农场里原地等：先刷新站位把人和镜头拉回石盘，等到
+# 点再走回石像点一键务农，全程十来秒。设为 0 则退回"一律退游戏重来"的老行为。
+DEFAULT_INGAME_WAIT_MAX_MIN = 3.0
+MAX_INGAME_WAIT_MAX_MIN = 15.0
+# 同一次进游戏里最多就地重走这么多回。相邻节点正常隔着几十分钟，一轮撑死用
+# 上一两回；设上限是兜底：就地收割万一不生效（一键务农没弹、点了没动静），
+# 超了就退回"退游戏重进"的老办法，不至于在农场里空转。
+INGAME_REDO_MAX_TIMES = 3
+
+
+def ingame_wait_max_seconds():
+    """原地短等门槛（秒）；读 WZRY_INGAME_WAIT_MAX_MIN，范围限 0~15 分钟。"""
+    raw = (os.environ.get("WZRY_INGAME_WAIT_MAX_MIN") or "").strip()
+    if not raw:
+        return DEFAULT_INGAME_WAIT_MAX_MIN * 60
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"  ⚠️ WZRY_INGAME_WAIT_MAX_MIN 无法识别（{raw}），"
+              f"按默认 {DEFAULT_INGAME_WAIT_MAX_MIN:g} 分钟")
+        return DEFAULT_INGAME_WAIT_MAX_MIN * 60
+    return min(max(value, 0.0), MAX_INGAME_WAIT_MAX_MIN) * 60
+
+
 GAME_PKG = "com.tencent.tmgp.sgame"
 GAME_ACT = f"{GAME_PKG}/com.tencent.tmgp.sgame.SGameActivity"
 
@@ -1746,6 +1773,42 @@ def step9_move_to_farmland(save_if_fresh=False):
 # ============================================================
 # 步骤10: 计算等待时间
 # ============================================================
+def next_target_time(result, maturity_dt):
+    """本轮真正要等到的那个节点：浇水早于成熟就等浇水，否则等成熟。
+
+    :return: (节点时刻, "浇水"/"成熟")；没识别出成熟时间时返回 (None, "")
+    """
+    if not maturity_dt:
+        return None, ""
+    next_watering = (result or {}).get("next_water")
+    if next_watering and next_watering < maturity_dt:
+        return next_watering, "浇水"
+    return maturity_dt, "成熟"
+
+
+def should_wait_in_farm(target_time, now=None):
+    """节点近到不值得退游戏重来了？近就留在农场里原地等（见步骤10b）。"""
+    limit = ingame_wait_max_seconds()
+    if limit <= 0 or not target_time:
+        return False
+    left = (target_time - (now or datetime.now())).total_seconds()
+    return 0 < left <= limit
+
+
+def plan_in_place_redo(result, maturity_dt, is_mature):
+    """要不要不退游戏、就地重走一遍步骤6/7（见步骤10b）？
+
+    :return: (要不要, 等到哪一刻（None 表示不用等）, 说法)
+    """
+    if is_mature:
+        # 作物已经能收了，不必退游戏重进——刷新站位、走回石像再点一次就是
+        return True, None, "作物已成熟"
+    target_time, reason = next_target_time(result, maturity_dt)
+    if should_wait_in_farm(target_time):
+        return True, target_time, reason
+    return False, None, ""
+
+
 def step10_calculate_wait(result, maturity_dt, is_mature=False):
     """步骤10: 根据成熟时间和浇水时间计算等待时间
 
@@ -1756,7 +1819,9 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
     """
     print("\n[步骤10] 计算等待时间...")
 
-    # 作物已成熟可收获，直接重启收割；识别失败则走下方5分钟重试分支
+    # 作物已成熟可收获：正常由步骤10b 就地收割，走到这里说明就地重走过几回
+    # 仍没收上（一键务农没弹或点了没动静），退回老办法——退游戏重进再收一次。
+    # 识别失败则走下方5分钟重试分支
     if is_mature:
         print("  🌾 作物已成熟，退出游戏重新进入收割...")
         random_screen_fiddle()
@@ -1773,27 +1838,15 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
     _reapply_low_brightness()
     
     now = datetime.now()
-    
-    # 确定唤醒时间
-    wake_time = None
-    reason = ""
-    
-    if result and maturity_dt:
-        # 获取下次浇水时间（None 表示已过最后节点，等成熟）
-        next_watering = result.get("next_water")
-        
-        if next_watering and next_watering < maturity_dt:
-            wake_time = next_watering
-            reason = "浇水"
-            print(f"  💧 下次浇水时间: {next_watering.strftime('%m-%d %H:%M:%S')} (早于成熟时间)")
-        else:
-            wake_time = maturity_dt
-            reason = "成熟"
-            print(f"  🌾 成熟时间: {maturity_dt.strftime('%m-%d %H:%M:%S')} (早于浇水时间)")
-    elif maturity_dt:
-        wake_time = maturity_dt
-        reason = "成熟"
-        print(f"  🌾 成熟时间: {maturity_dt.strftime('%m-%d %H:%M:%S')}")
+
+    # 确定唤醒时间：等哪个节点（浇水/成熟）与步骤10b 用的是同一套判据
+    wake_time, reason = next_target_time(result, maturity_dt)
+    if wake_time and reason == "浇水":
+        print(f"  💧 下次浇水时间: {wake_time.strftime('%m-%d %H:%M:%S')} (早于成熟时间)")
+    elif wake_time and result:
+        print(f"  🌾 成熟时间: {wake_time.strftime('%m-%d %H:%M:%S')} (早于浇水时间)")
+    elif wake_time:
+        print(f"  🌾 成熟时间: {wake_time.strftime('%m-%d %H:%M:%S')}")
     else:
         print("  ⚠️ 无法识别时间，5分钟后重试...")
         retry_time = now + timedelta(minutes=5)
@@ -1820,6 +1873,51 @@ def step10_calculate_wait(result, maturity_dt, is_mature=False):
     print(f"  ⏳ 等待 {hours}小时{minutes}分{seconds:02d}秒")
     record_next_wake(wake_time, target_time, reason, result)
     return wake_time
+
+# ============================================================
+# 步骤10b: 就地重来（不退游戏，回石盘再走一遍）
+# ============================================================
+def step10b_farm_again_in_place(target_time, reason, result=None):
+    """不退游戏，把人拉回石盘、必要时等到点，再重走一遍步骤6/7。
+
+    退游戏重来那条路要两分多钟（启动→登录→关弹窗→进农场→走到石像），两种
+    情形不值得走它：作物已经能收了；以及下一个节点只剩一两分钟——后者这么走
+    必然晚到，而晚到的代价不止这两分钟，一键务农只认"到点了没"，没到就白点
+    一次，得按整轮再等一遍。1 小时档每个周期都撞上这一下：最后一次浇水后离
+    成熟只剩 1 分钟。
+
+    先刷新站位：步骤9 把人从石盘推到了土地边上，推杆是从**当前**位置起步的，
+    不复位就再推一次会一路冲进土地里，一键务农根本不弹（与步骤7失败后重走
+    踩的是同一个坑）。刷新站位把位置和镜头一起复位，重走的起点分毫不差。
+
+    :param target_time: 要等到的节点时刻；None 表示不必等（作物已能收）
+    """
+    if target_time:
+        print(f"\n[步骤10b] 离{reason}只剩一小会儿，留在农场里等，不退游戏...")
+    else:
+        print(f"\n[步骤10b] {reason}，不退游戏，回石盘重走一遍...")
+
+    if reset_position():
+        print("  ✅ 已刷新站位，回到石盘")
+    else:
+        print("  ⚠️ 没点到刷新站位，就地继续（重走时可能要多补几步）")
+
+    if not target_time:
+        record_next_wake(datetime.now(), None, reason, result)
+        return True
+
+    # 存档照记：这段等待里进程被停掉时，另一台电脑接力才知道该等到哪一刻
+    record_next_wake(target_time, target_time, f"{reason}（原地等待）", result)
+
+    wait_seconds = max(0, int((target_time - datetime.now()).total_seconds()))
+    print(f"  🎯 目标时间: {target_time.strftime('%H:%M:%S')} ({reason})")
+    print(f"  ⏳ 原地等待 {wait_seconds} 秒，到点后重新一键务农")
+    # 不留提前量：走回石像只要十来秒，而早到一秒就点不出该点的那一下，晚几秒
+    # 却毫发无损（浇水减的分钟数固定，晚下手不会少减）——所以等满了再走。
+    # 也不熄屏：屏一灭游戏就退到后台，回来还得重登，这条捷径就白走了
+    wait_or_farm_now(wait_seconds)
+    return True
+
 # ============================================================
 # 手机端存档（换电脑接力挂机）
 # ============================================================
@@ -2402,35 +2500,58 @@ def main():
                 force_stop_game()
                 continue
         
-            # 步骤6: 移动到雕像
-            step6_move_to_statue()
-        
-            # 步骤7: 一键务农
-            farm_ok, _ = step7_oneclick_farm()
-            if not farm_ok:
-                print("\n⚠️ 步骤7失败，刷新站位后从石盘重走...")
-                step6_move_to_statue(reset_first=True)
-                farm_ok, _ = step7_oneclick_farm(nudge=False)
-            if not farm_ok:
-                print("\n❌ 步骤7连续失败，本轮结束")
+            # 步骤6~10 在同一次进游戏里可能跑好几圈：作物已经能收、或下一个
+            # 节点近在眼前时都不退游戏，回石盘重走一遍就是（步骤10b）
+            wake_time = None
+            farm_failed = False
+            harvest_now = False
+            in_farm_redos = 0
+            while True:
+                # 步骤6: 移动到雕像
+                step6_move_to_statue()
+
+                # 步骤7: 一键务农
+                farm_ok, _ = step7_oneclick_farm()
+                if not farm_ok:
+                    print("\n⚠️ 步骤7失败，刷新站位后从石盘重走...")
+                    step6_move_to_statue(reset_first=True)
+                    farm_ok, _ = step7_oneclick_farm(nudge=False)
+                if not farm_ok:
+                    print("\n❌ 步骤7连续失败，本轮结束")
+                    farm_failed = True
+                    break
+
+                # 步骤8: 关闭收获弹窗
+                _, harvested = step8_close_harvest()
+
+                # 步骤9: 移动到土地，读取成熟时间，计算下次浇水时间
+                result, maturity_dt, is_mature = step9_move_to_farmland(
+                    save_if_fresh=harvested
+                )
+
+                # 步骤10b: 作物已经能收、或节点就在眼前，都别退游戏，
+                # 回石盘（必要时等到点）重走一遍
+                redo, redo_at, redo_reason = plan_in_place_redo(
+                    result, maturity_dt, is_mature
+                )
+                if redo and in_farm_redos < INGAME_REDO_MAX_TIMES:
+                    in_farm_redos += 1
+                    step10b_farm_again_in_place(redo_at, redo_reason, result)
+                    continue
+
+                # 步骤10: 计算等待时间，返回唤醒时间
+                wake_time = step10_calculate_wait(result, maturity_dt, is_mature)
+                # 就地收割没收上，步骤10 已经退了游戏，立即重开一轮收割
+                harvest_now = wake_time is None
+                break
+
+            if farm_failed:
                 stats.finish_round("失败：未找到一键务农")
                 force_stop_game()
                 wait_or_farm_now(30)
                 continue
-        
-            # 步骤8: 关闭收获弹窗
-            _, harvested = step8_close_harvest()
 
-            # 步骤9: 移动到土地，读取成熟时间，计算下次浇水时间
-            result, maturity_dt, is_mature = step9_move_to_farmland(
-                save_if_fresh=harvested
-            )
-
-            # 步骤10: 计算等待时间，返回唤醒时间
-            wake_time = step10_calculate_wait(result, maturity_dt, is_mature)
-        
-            if wake_time is None:
-                # 作物已成熟，立即重新开始
+            if harvest_now:
                 stats.finish_round("完成：作物已成熟，立即收割")
                 continue
 

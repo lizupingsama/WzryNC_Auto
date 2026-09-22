@@ -1081,6 +1081,138 @@ class StatueApproachTests(unittest.TestCase):
         self.assertEqual(moves, [])
 
 
+class InPlaceRedoTests(unittest.TestCase):
+    """作物已能收、或节点近在眼前时就地重走一遍，不退游戏（步骤10b）。"""
+
+    @staticmethod
+    def _limit(raw):
+        with patch.dict(os.environ, {"WZRY_INGAME_WAIT_MAX_MIN": raw}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return wzry_auto.ingame_wait_max_seconds()
+
+    @staticmethod
+    def _near(seconds, threshold=""):
+        now = datetime.now()
+        target = now + timedelta(seconds=seconds)
+        with patch.dict(os.environ, {"WZRY_INGAME_WAIT_MAX_MIN": threshold}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return wzry_auto.should_wait_in_farm(target, now)
+
+    def test_default_threshold_is_three_minutes(self):
+        self.assertEqual(wzry_auto.DEFAULT_INGAME_WAIT_MAX_MIN, 3.0)
+        self.assertEqual(self._limit(""), 180)
+
+    def test_threshold_is_clamped_and_garbage_falls_back(self):
+        self.assertEqual(
+            self._limit("99"), wzry_auto.MAX_INGAME_WAIT_MAX_MIN * 60
+        )
+        self.assertEqual(self._limit("-5"), 0)
+        self.assertEqual(self._limit("三分钟"), 180)
+
+    def test_a_node_one_minute_out_waits_in_the_farm(self):
+        # 1 小时档每个周期都落在这里：最后一次浇水后离成熟只剩 1 分钟，
+        # 退游戏重进要两分多钟，这么走必然晚到，白等一整个周期
+        self.assertTrue(self._near(60))
+
+    def test_a_node_far_enough_away_still_quits_the_game(self):
+        self.assertFalse(self._near(600))
+
+    def test_a_node_already_past_is_not_waited_for(self):
+        self.assertFalse(self._near(-30))
+
+    def test_zero_threshold_turns_the_shortcut_off(self):
+        self.assertFalse(self._near(60, threshold="0"))
+
+    def test_target_is_the_earlier_of_watering_and_maturity(self):
+        mature = datetime.now() + timedelta(minutes=30)
+        water = mature - timedelta(minutes=5)
+        self.assertEqual(
+            wzry_auto.next_target_time({"next_water": water}, mature),
+            (water, "浇水"),
+        )
+        # 已过最后一个浇水节点：next_water 为 None，改等成熟
+        self.assertEqual(
+            wzry_auto.next_target_time({"next_water": None}, mature),
+            (mature, "成熟"),
+        )
+        self.assertEqual(wzry_auto.next_target_time(None, None), (None, ""))
+
+    def test_a_harvestable_crop_is_reaped_without_relaunching(self):
+        # 步骤9 读到"可收获"时也别退游戏：刷新站位走回石像再点一次就收上了
+        redo, wait_until, reason = wzry_auto.plan_in_place_redo(
+            None, None, is_mature=True
+        )
+        self.assertTrue(redo)
+        self.assertIsNone(wait_until, "已经能收了，没什么可等的")
+        self.assertEqual(reason, "作物已成熟")
+
+    def test_a_far_node_is_left_to_the_quit_and_wait_path(self):
+        mature = datetime.now() + timedelta(minutes=30)
+        redo, wait_until, _ = wzry_auto.plan_in_place_redo(
+            {"next_water": None, "mature_time": mature}, mature, is_mature=False
+        )
+        self.assertFalse(redo)
+        self.assertIsNone(wait_until)
+
+    def test_a_near_node_is_waited_out_then_redone(self):
+        mature = datetime.now() + timedelta(seconds=70)
+        redo, wait_until, reason = wzry_auto.plan_in_place_redo(
+            {"next_water": None, "mature_time": mature}, mature, is_mature=False
+        )
+        self.assertTrue(redo)
+        self.assertEqual((wait_until, reason), (mature, "成熟"))
+
+    def _redo(self, target):
+        """跑一遍步骤10b，返回各路 mock 供断言。"""
+        with contextlib.ExitStack() as stack:
+            mocks = {
+                name: stack.enter_context(patch.object(wzry_auto, name, **kw))
+                for name, kw in (
+                    ("reset_position", {"return_value": True}),
+                    ("adb_shell", {}), ("adb_input", {}),
+                    ("record_next_wake", {}), ("wait_or_farm_now", {}),
+                )
+            }
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            wzry_auto.step10b_farm_again_in_place(
+                target, "成熟" if target else "作物已成熟", {"tier_min": 60}
+            )
+        self.assertTrue(mocks["reset_position"].called, "重走前要把人和镜头一起拉回石盘")
+        self.assertEqual(mocks["adb_shell"].call_args_list, [], "就地重来就不能退游戏")
+        self.assertEqual(
+            mocks["adb_input"].call_args_list, [], "也不能熄屏，屏一灭游戏就退到后台"
+        )
+        return mocks
+
+    def test_harvest_redo_walks_back_at_once_without_waiting(self):
+        mocks = self._redo(None)
+        self.assertEqual(mocks["wait_or_farm_now"].call_args_list, [], "已能收就别等")
+
+    def test_short_wait_refreshes_position_and_keeps_the_game_running(self):
+        target = datetime.now() + timedelta(seconds=45)
+        with contextlib.ExitStack() as stack:
+            reset = stack.enter_context(
+                patch.object(wzry_auto, "reset_position", return_value=True)
+            )
+            shell = stack.enter_context(patch.object(wzry_auto, "adb_shell"))
+            keys = stack.enter_context(patch.object(wzry_auto, "adb_input"))
+            record = stack.enter_context(
+                patch.object(wzry_auto, "record_next_wake")
+            )
+            wait = stack.enter_context(
+                patch.object(wzry_auto, "wait_or_farm_now")
+            )
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            wzry_auto.step10b_farm_again_in_place(
+                target, "成熟", {"tier_min": 60}
+            )
+        self.assertTrue(reset.called, "等之前要把人和镜头一起拉回石盘")
+        self.assertEqual(shell.call_args_list, [], "原地等就不能退游戏")
+        self.assertEqual(keys.call_args_list, [], "也不能熄屏，屏一灭游戏就退到后台")
+        self.assertEqual(record.call_args[0][0], target, "存档要记下这个节点")
+        self.assertLessEqual(wait.call_args[0][0], 45)
+
+
 class Step6EnvOverrideTests(unittest.TestCase):
     """推杆参数可用环境变量微调，不必改代码重新打包。"""
 
