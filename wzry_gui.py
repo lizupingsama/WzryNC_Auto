@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import font as tkfont, messagebox
 
 import wzry_updater
 
@@ -59,6 +59,13 @@ except ImportError:
         APP_TITLE, "缺少界面依赖 customtkinter。\n请运行 start_gui.bat 安装依赖后重试。",
     )
     raise
+
+# 必须在创建任何 CTk 控件之前打补丁：合并拖窗口时的重画、去掉滚动条的
+# update_idletasks，否则拖一下边框每个控件都要各自重画一遍（见 wzry_ctk_perf）
+import wzry_ctk_perf
+import wzry_resize_guard
+
+wzry_ctk_perf.install()
 
 # 亮度选项：显示文本 -> 传给脚本的 WZRY_BRIGHTNESS 值
 BRIGHTNESS_OPTIONS = [
@@ -177,6 +184,7 @@ class FarmGui:
         self._restart_job = None
         self._tray = None
         self._tray_hint_shown = False
+        self._resize_guard = None
         self._adb_task = None
         self._pair_win = None
         self._device_poll_thread = None
@@ -195,6 +203,11 @@ class FarmGui:
         self._status_kind = "idle"
 
         self._build_ui()
+        # 拖边框时界面卡顿的补救（慢机器上才真正生效，见 wzry_resize_guard.py）
+        self._resize_guard = wzry_resize_guard.install(
+            self.root, self.config, on_decide=self._on_resize_decided,
+            hint_font=self._tk_font(self.font_small),
+        )
         self._init_window_icon()
         self._create_tray()
         self._resolve_adb()
@@ -540,6 +553,38 @@ class FarmGui:
             wrap="word", state="disabled",
         )
         self.log_text.pack(fill="both", expand=True, padx=pad, pady=(2, pad))
+
+    def _tk_font(self, ctk_font):
+        """把 CTkFont 转成原生 tk 控件能用、且一样按 DPI 缩放的字体。
+
+        CTkFont 本身就是 tkinter.font.Font，但 CTk 控件画字时会乘上界面缩放
+        系数，原生控件不会；不补这一步，高 DPI 屏上这行字会比旁边的小一号。
+        """
+        try:
+            scale = ctk.ScalingTracker.get_widget_scaling(self.root)
+        except Exception:
+            scale = 1.0
+        size = abs(int(ctk_font.cget("size"))) or 12
+        return tkfont.Font(family=ctk_font.cget("family"),
+                           size=-max(int(round(size * scale)), 1),
+                           weight=ctk_font.cget("weight"))
+
+    def _on_resize_decided(self, guard):
+        """resize 守卫判定「这机器拖窗口画不动」时写进日志，方便排查。"""
+        if not guard.enabled:
+            return
+        if guard.layout_ms is not None:
+            why = f"重排一次窗口要 {guard.layout_ms:.0f}ms"
+        else:
+            why = f"每动一次窗口要 {guard.tax_us:.0f}µs（正常几 µs）"
+        self._append_log(
+            f"[界面] 这台机器{why}，拖动边框时先把内容收起来，松手就恢复\n"
+        )
+        self._append_log(
+            "[界面] 多半是有软件往所有程序里注入了窗口钩子（输入法皮肤、"
+            "录屏浮层一类）；不想收内容可在 assets/gui_config.json 里"
+            "把 smooth_resize 改成 off\n"
+        )
 
     def _init_window_icon(self):
         try:
@@ -980,6 +1025,9 @@ class FarmGui:
                 pass
 
     def show_window(self):
+        # 万一是拖到一半缩进托盘的，先把收起来的内容放回去，别露出一个空窗口
+        if self._resize_guard is not None:
+            self._resize_guard.flush()
         self.root.deiconify()
         self.root.lift()
         try:
@@ -1854,6 +1902,9 @@ class FarmGui:
             "wireless_device": self._entry_text("device_entry", "wireless_device"),
             "unlock_pwd": self._entry_text("pwd_entry", "unlock_pwd"),
             "log_collapse": bool(self.collapse_var.get()),
+            # 界面没有对应开关，写回来只是为了让这个键在配置文件里看得见，
+            # 想强制开/关拖动时收内容的人知道该改哪儿（auto / on / off）
+            "smooth_resize": str(self.config.get("smooth_resize", "auto")),
         })
         self.config = cfg
         try:
