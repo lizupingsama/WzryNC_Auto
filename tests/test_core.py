@@ -859,6 +859,36 @@ class DeviceArchiveTests(unittest.TestCase):
         wait.assert_not_called()
         self.assertIsNone(wzry_auto._archive_tier_min)
 
+    def test_reconnect_reread_waits_for_the_other_pc_water_time(self):
+        """离线重连：手机刚在另一台电脑上挂过，接着等存档里的浇水点。
+
+        过去重连后直接进下一轮务农，存档只在启动时读一次；手机在两地
+        来回挂时，这一下就会在不该浇的时刻白浇一次水。
+        """
+        other = self._archive(host="OTHER-PC")
+        with patch.object(wzry_auto, "load_device_archive", return_value=other),              patch.object(wzry_auto, "_device_epoch", return_value=1_758_400_000),              patch.object(wzry_auto, "wait_or_farm_now") as wait:
+            self.assertTrue(wzry_auto.restore_device_archive(reread=True))
+        self.assertAlmostEqual(wait.call_args[0][0], 3600, delta=2)
+
+    def test_reconnect_reread_retries_flaky_read_before_giving_up(self):
+        """刚重连上的 adb 抖一下不能算"没有存档"，否则照样白浇一次。"""
+        payload = json.dumps(self._archive()).encode("utf-8")
+        with patch.object(
+                 wzry_auto, "_read_device_file", side_effect=[None, None, payload]
+             ) as read,              patch.object(wzry_auto, "_device_epoch", return_value=1_758_400_000),              patch.object(wzry_auto.time, "sleep"),              patch.object(wzry_auto, "wait_or_farm_now") as wait:
+            self.assertTrue(wzry_auto.restore_device_archive(reread=True))
+        self.assertEqual(read.call_count, 3)
+        self.assertAlmostEqual(wait.call_args[0][0], 3600, delta=2)
+
+    def test_missing_file_is_not_retried(self):
+        """文件确实不存在时读到的是 No such file（退出码 0），重试纯属浪费。"""
+        missing = b"cat: /sdcard/wzry_farm/state.json: No such file or directory\n"
+        with patch.object(
+                 wzry_auto, "_read_device_file", return_value=missing
+             ) as read:
+            self.assertIsNone(wzry_auto.load_device_archive(retries=3))
+        self.assertEqual(read.call_count, 1)
+
     def test_archive_of_another_phone_is_ignored(self):
         archive = self._archive(device_id="0123456789abcdef")
         with patch.object(wzry_auto, "load_device_archive", return_value=archive), \

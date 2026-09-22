@@ -1919,13 +1919,24 @@ def _write_device_file(remote, data):
     return True
 
 
-def load_device_archive():
+def load_device_archive(retries=1):
     """读手机上的挂机存档；没有存档、内容损坏或读失败都返回 None。
 
     exec-out 会把设备端的 stderr 并进 stdout 且退出码始终为 0，
     因此只能按内容判断：开头不是 JSON 就当没有存档。
+
+    :param retries: adb 层读失败时的总尝试次数。刚重连上的那一刻 adb 常还
+        没稳住，一次读失败被当成"手机上没有存档"就会白浇一次水；文件真的
+        不存在时读到的是 "No such file"（不算读失败），不会走重试
     """
-    raw = _read_device_file(DEVICE_ARCHIVE_FILE)
+    raw = None
+    for attempt in range(max(1, retries)):
+        raw = _read_device_file(DEVICE_ARCHIVE_FILE)
+        if raw is not None:
+            break
+        if attempt + 1 < retries:
+            print("  ⏳ 读手机存档失败，2 秒后重试")
+            time.sleep(2)
     if not raw:
         return None
     text = raw.decode("utf-8", "replace").strip()
@@ -2034,26 +2045,36 @@ def _note_previous_host(data):
         print(f"     若「{host}」那台电脑仍在挂机，请先停掉（两边同时挂会互相打断）")
 
 
-def restore_device_archive():
-    """启动时按手机存档接力：命中就等到存档里的唤醒时刻再开始第一轮。
+def restore_device_archive(reread=False):
+    """按手机存档接力：命中就等到存档里的唤醒时刻再动手。
 
+    启动时调一次；离线重连后再调一次（reread=True）——手机被带去另一个
+    地方、在另一台电脑上挂过一段的话，存档里的浇水点比本机记着的更新，
+    不重读就会一重连就务农，白浇掉一次减时。
+
+    :param reread: 离线重连后的复读。这种场合读不到存档只是照常开工，
+        不必再喊"按全新务农"，读存档也多试几次防 adb 刚通时抖一下
     :return: True 表示已按存档等待过（含被「立刻务农」打断），
              False 表示没有可用存档，照常立即开始务农
     """
     global _archive_tier_min
 
+    fresh = "照常开工" if reread else "按全新务农开始"
+
     if not archive_enabled():
-        print("  ☁️ 已关闭手机存档接力，按全新务农开始")
+        # 复读时不必每次重连都念一遍开关状态，启动那次已经说过了
+        if not reread:
+            print("  ☁️ 已关闭手机存档接力，按全新务农开始")
         return False
 
-    data = load_device_archive()
+    data = load_device_archive(retries=3 if reread else 1)
     if not data:
-        print("  ☁️ 手机上没有挂机存档，按全新务农开始")
+        print(f"  ☁️ 手机上没有挂机存档，{fresh}")
         return False
 
     saved_id = str(data.get("device_id") or "")
     if saved_id and DEVICE_ID and saved_id != DEVICE_ID:
-        print(f"  ⚠️ 存档属于另一台手机({saved_id})，忽略并按全新务农开始")
+        print(f"  ⚠️ 存档属于另一台手机({saved_id})，忽略并{fresh}")
         return False
 
     print(f"  ☁️ 读到手机存档：{data.get('host') or '未知电脑'} 于 "
@@ -2062,7 +2083,7 @@ def restore_device_archive():
 
     wake_at = _archive_wake_time(data)
     if wake_at is None:
-        print("  ⚠️ 存档里没有可用的唤醒时间，忽略并按全新务农开始")
+        print(f"  ⚠️ 存档里没有可用的唤醒时间，忽略并{fresh}")
         return False
 
     reason = data.get("reason") or "唤醒"
@@ -2072,7 +2093,7 @@ def restore_device_archive():
     if wait_seconds < -ARCHIVE_STALE_SECONDS:
         stale_hours = -wait_seconds // 3600
         print(f"  ⚠️ 存档已过期 {stale_hours} 小时（早于任何一次正常等待），"
-              "忽略并按全新务农开始")
+              f"忽略并{fresh}")
         return False
 
     tier_min = data.get("tier_min")
@@ -2335,6 +2356,15 @@ def main():
                     if ensure_device_connected(max_attempts=1):
                         print("  ✅ 设备恢复连接，继续挂机")
                         break
+                # 离线这段手机多半是被带去了另一个地方、在另一台电脑上挂过：
+                # 存档重读一遍，没到存档里的浇水点就接着等，不再一重连就务农
+                # 白浇一次（存档时间已过或读不到时立即开工，同以往）。
+                # android_id 不随重连改变，这里不重取——刚连上时读抖一下就会
+                # 退化成 adb 地址，反倒把自己的存档判成"另一台手机"；只有启动
+                # 那次就退化了才补一枪
+                if DEVICE_ID == DEVICE:
+                    DEVICE_ID = get_device_id()
+                restore_device_archive(reread=True)
                 continue
 
             # 唤醒屏幕并解锁（首轮启动或长等待后手机可能处于息屏状态）
