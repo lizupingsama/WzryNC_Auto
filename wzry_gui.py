@@ -23,7 +23,6 @@ import sys
 import threading
 import time
 import traceback
-import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -1917,7 +1916,8 @@ class FarmGui:
         """本机的上传身份，首次使用时生成并存进配置；排查码就是它的前 8 位。"""
         client_id = str(self.config.get("log_client_id") or "")
         if not wzry_logupload.is_client_id(client_id):
-            client_id = uuid.uuid4().hex
+            # 不用 uuid：它会把 _uuid.pyd 带进运行库，在线更新就得整包重下 74 MB
+            client_id = os.urandom(16).hex()
             self.config["log_client_id"] = client_id
             self._save_config()
         return client_id
