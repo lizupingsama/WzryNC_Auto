@@ -1,12 +1,12 @@
 {
-  "last_commit": "49c333f9f793ed68438c7677c4afa7463be0d0c9",
-  "last_version": "20260922-2",
-  "last_build": 2026092202,
-  "runtime_key": "070b4aa4840b1c89d4390b55d313881419e05e44608256f68c64763439c6ebcb",
+  "last_commit": "858da8b2bdd4cc8a2d2acb432768f70192ea9d70",
+  "last_version": "20260923-1",
+  "last_build": 2026092301,
+  "runtime_key": "3ded17b84182dc347c0f084d2aa148623cbf022c500aa8b4f0bec1254906ab7d",
   "runtime_pack": {
-    "name": "runtime_20260827-3.zip",
-    "sha256": "d5a8f7159a1aad586cb88b5bcfb37df0e35396c133187c11cab72dab5c6afc7d",
-    "size": 77978621,
+    "name": "runtime_20260923-1.zip",
+    "sha256": "a4806e73002e96f5bddff960846433c3b8f7d33b4a43e9d661b00d6563c01dc1",
+    "size": 77993407,
     "files": [
       "_internal/MSVCP140_1.dll",
       "_internal/PIL/_avif.cp312-win_amd64.pyd",
@@ -955,6 +955,7 @@
       "_internal/_tk_data/unsupported.tcl",
       "_internal/_tk_data/xmfbox.tcl",
       "_internal/_tkinter.pyd",
+      "_internal/_uuid.pyd",
       "_internal/_wmi.pyd",
       "_internal/api-ms-win-core-console-l1-1-0.dll",
       "_internal/api-ms-win-core-datetime-l1-1-0.dll",
@@ -1173,7 +1174,7 @@
       "platform-tools/libwinpthread-1.dll",
       "platform-tools/source.properties"
     ],
-    "url": "https://gitee.com/lizupingsama/Farm-Automation-Assistant/releases/download/v20260827-3/runtime_20260827-3.zip"
+    "url": "https://gitee.com/lizupingsama/Farm-Automation-Assistant/releases/download/v20260923-1/runtime_20260923-1.zip"
   },
   "gitee_repo": "lizupingsama/Farm-Automation-Assistant"
 }
