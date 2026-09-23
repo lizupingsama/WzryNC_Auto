@@ -1,0 +1,4 @@
+# 在 Linux 上执行的文件固定 LF：core.autocrlf=true 的 Windows 检出会转成 CRLF，
+# bash 读到 \r 直接报错（server/install.sh 要 scp 到服务器上跑）
+*.sh text eol=lf
+*.service text eol=lf
