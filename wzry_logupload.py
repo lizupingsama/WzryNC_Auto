@@ -11,8 +11,11 @@
 一份，每小时自动上传不会把同样的图反复堆上去。
 
 采集（collect_* / build_report）与上传（upload）分开：前者纯本地、可单测，
-后者只管 HTTP。服务端见 server/log_server.py；上传地址可用环境变量
-WZRY_LOG_UPLOAD_URL 或 gui_config.json 的 log_upload_url 覆盖。
+后者只管 HTTP。服务端见 server/log_server.py。
+
+上传地址不写进源码（仓库是公开的）：放在程序目录下的 log_upload_url.txt，这个
+文件不入库，打包时由 packaging/build_release.py 复制进发布包；也可用环境变量
+WZRY_LOG_UPLOAD_URL 或 gui_config.json 的 log_upload_url 指定。
 """
 
 import gzip
@@ -29,8 +32,9 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-SERVER_HOST = "47.108.49.28"
-DEFAULT_URL = f"http://{SERVER_HOST}:8421/api/logs"
+URL_FILE = "log_upload_url.txt"   # 程序目录（源码运行时即项目根目录）下，不入库
+# 只用来问系统「连外网走哪块网卡」：UDP connect 不发包，换成任何公网地址都一样
+ROUTE_PROBE_HOST = "223.5.5.5"
 # 不是密钥：客户端代码谁都拿得到，只为挡掉扫端口的机器人往服务器乱投
 UPLOAD_KEY = "9TjhkucIejJuUElCRpSE541a"
 SCHEMA = 1
@@ -81,11 +85,29 @@ class UploadError(Exception):
     """上传失败，消息可直接给用户看。"""
 
 
-def upload_url(config=None):
+def read_url_file(path):
+    """地址文件里第一行不以 # 开头的非空内容；文件不在或读不了返回空串。"""
+    try:
+        # utf-8-sig：记事本另存可能带 BOM
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def upload_url(config=None, base_dir=None):
+    """上传地址：环境变量 > gui_config.json 的 log_upload_url > 程序目录下的地址文件。
+
+    都没配置返回空串，上传功能不可用（公开仓库里直接跑源码就是这样）。
+    """
     return (
-        os.environ.get("WZRY_LOG_UPLOAD_URL")
+        os.environ.get("WZRY_LOG_UPLOAD_URL", "").strip()
         or str((config or {}).get("log_upload_url") or "").strip()
-        or DEFAULT_URL
+        or (read_url_file(Path(base_dir) / URL_FILE) if base_dir is not None else "")
     )
 
 
@@ -239,7 +261,7 @@ def _primary_ip():
     """本机连外网走的那块网卡的地址。UDP connect 不发包，只让系统选一次路由。"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect((SERVER_HOST, 80))
+            sock.connect((ROUTE_PROBE_HOST, 80))
             return sock.getsockname()[0]
     except OSError:
         return ""

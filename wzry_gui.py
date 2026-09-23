@@ -1933,8 +1933,22 @@ class FarmGui:
 
         self.root.after(self.LOG_UPLOAD_FIRST, tick)
 
+    def _log_upload_url(self):
+        return wzry_logupload.upload_url(self.config, SCRIPT_DIR)
+
+    def _warn_no_upload_url(self):
+        message = (
+            f"没有配置日志上传地址。\n\n在程序目录新建 {wzry_logupload.URL_FILE}，"
+            "写上服务器的上传地址即可（发布包里自带，自己跑源码时才需要）。"
+        )
+        self._append_log(f"[日志上传] ❌ {message.splitlines()[0]}\n")
+        messagebox.showerror(APP_TITLE, message)
+
     def open_log_upload_dialog(self):
         """手动上传：可以留个称呼和问题描述，传完把排查码发给作者。"""
+        if not self._log_upload_url():
+            self._warn_no_upload_url()
+            return
         if self._log_upload_win is not None and self._log_upload_win.winfo_exists():
             self._log_upload_win.lift()
             self._log_upload_win.focus_force()
@@ -1996,12 +2010,18 @@ class FarmGui:
             if not auto:
                 self._append_log("[日志上传] 上一次上传还没结束，请稍候\n")
             return
+        url = self._log_upload_url()
+        if not url:
+            if not auto:  # 自动上传没地址就安静跳过
+                self._warn_no_upload_url()
+            return
         self._log_upload_busy = True
         self.btn_upload_log.configure(state="disabled", text="上传中…")
         if not auto:
             self._append_log("[日志上传] 正在收集并上传日志 ...\n")
         snapshot = {
             "auto": auto,
+            "url": url,
             "note": note,
             "client_id": self._log_client_id(),
             "nickname": str(self.config.get("log_nickname", "")),
@@ -2059,7 +2079,7 @@ class FarmGui:
                 phone=phone,
             )
             body = wzry_logupload.encode_report(report)
-            url = wzry_logupload.upload_url(snap["config"])
+            url = snap["url"]
             receipt = wzry_logupload.upload(body, url, APP_VERSION)
         except Exception as exc:
             self.cmd_queue.put(("log_upload_done", (snap, None, None, exc)))

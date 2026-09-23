@@ -105,6 +105,30 @@ class SanitizeTests(unittest.TestCase):
         self.assertTrue(noise.endswith(decoded["run_log"]["text"]))  # 留下的是最新的
 
 
+class UploadUrlTests(unittest.TestCase):
+    def test_url_file_env_and_config_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WZRY_LOG_UPLOAD_URL", None)
+            self.assertEqual(lu.upload_url({}, tmp), "")            # 什么都没配：上传不可用
+            # 记事本另存的 BOM、注释行、空行都不碍事
+            (Path(tmp) / lu.URL_FILE).write_bytes(
+                "﻿# 注释\n\n  http://file.example:8421/api/logs  \n".encode("utf-8"))
+            self.assertEqual(lu.upload_url({}, tmp), "http://file.example:8421/api/logs")
+            self.assertEqual(lu.upload_url({"log_upload_url": "http://cfg/api/logs"}, tmp),
+                             "http://cfg/api/logs")
+            os.environ["WZRY_LOG_UPLOAD_URL"] = "http://env/api/logs"
+            self.assertEqual(lu.upload_url({"log_upload_url": "http://cfg/api/logs"}, tmp),
+                             "http://env/api/logs")
+            os.environ.pop("WZRY_LOG_UPLOAD_URL")
+
+    def test_url_file_at_app_root_ships_with_online_update(self):
+        # 在线更新只下发根目录文件和几棵受管目录；地址文件放 assets/ 下老用户就收不到
+        import wzry_updater
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / lu.URL_FILE).write_text("http://x/api/logs", encoding="utf-8")
+            self.assertIn(lu.URL_FILE, wzry_updater.scan_release_files(tmp))
+
+
 class FakeAdb:
     """按命令关键字回放的假 adb。"""
 

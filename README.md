@@ -401,7 +401,7 @@ WZRY_DEVICE=192.168.1.100:5555 ./start.sh
 | `WZRY_STEP6_DURATION` | 步骤6按住摇杆的毫秒数（决定走多远），200~6000；走不到／走过石像时调它 |
 | `WZRY_STEP6_DISTANCE` | 步骤6推杆幅度 px（决定走多快），50~2000 |
 | `WZRY_STEP6_ANGLE` | 步骤6行走方向角度，0~360 |
-| `WZRY_LOG_UPLOAD_URL` | 日志上传地址，默认 `http://47.108.49.28:8421/api/logs`（也可写在 gui_config.json 的 `log_upload_url`） |
+| `WZRY_LOG_UPLOAD_URL` | 日志上传地址，优先于 gui_config.json 的 `log_upload_url` 和程序目录下的 `log_upload_url.txt`（见「日志上传」一节） |
 | `PYTHON_BIN` | Linux 创建虚拟环境所用的 Python |
 
 ## 亮度模式
@@ -560,14 +560,21 @@ tail -100 /tmp/wzry_run.log
 `server/` 下三个文件，服务器上只需要 Python 3.6+，不装任何依赖：
 
 ```bash
-ssh 阿里服务器 "mkdir -p /tmp/wzry-logserver"
-scp server/log_server.py server/wzry-logserver.service server/install.sh 阿里服务器:/tmp/wzry-logserver/
-ssh 阿里服务器 "bash /tmp/wzry-logserver/install.sh"
+ssh root@<服务器> "mkdir -p /tmp/wzry-logserver"
+scp server/log_server.py server/wzry-logserver.service server/install.sh root@<服务器>:/tmp/wzry-logserver/
+ssh root@<服务器> "bash /tmp/wzry-logserver/install.sh"
 ```
 
 装到 `/opt/wzry-logserver`，以 systemd 服务 `wzry-logserver` 运行（临时系统用户，
 内存上限 160 MB），监听 **8421**，数据在 `/var/lib/wzry-logserver`。重复执行即升级，
 数据与口令保留。
+
+**上传地址不进仓库**（仓库是公开的）：在项目根目录新建 `log_upload_url.txt`，写一行
+`http://<服务器>:8421/api/logs`（`#` 开头的行是注释）。这个文件已被 gitignore；源码直接
+运行时读它，`build_release.py` 打包时把它复制到发布包根目录，随在线更新一起下发。
+缺这个文件时构建会直接报错停下——发出去的包没地址，所有人的「上传日志」都会失效；
+确实不要上传功能就加 `--no-log-upload`。临时换地址可用环境变量 `WZRY_LOG_UPLOAD_URL`
+或 gui_config.json 的 `log_upload_url`。
 
 - **容量**：报告加截图的磁盘占用上限 1 GB（按实际占的磁盘块算），**写入前先腾地方**，
   任何时刻都不会超；先删最旧的自动上传和截图，删完了才动手动上传。单台电脑最多占 200 MB，
@@ -576,7 +583,7 @@ ssh 阿里服务器 "bash /tmp/wzry-logserver/install.sh"
 - **防刷**：上传需带客户端内置的 key（只挡扫端口的机器人，不算密钥）；每个 IP 每小时
   最多 30 次、每台电脑 12 次；压缩后超过 4 MB、解压后超过 32 MB 的一律拒收。截图只收
   回执里要过的（一小时内有效）、必须是 JPEG、单张不超过 3 MB，每个 IP 每小时最多 60 张。
-- **后台**：浏览器打开 `http://47.108.49.28:8421/admin`，输入管理口令（服务器上
+- **后台**：浏览器打开 `http://<服务器>:8421/admin`，输入管理口令（服务器上
   `/var/lib/wzry-logserver/admin_token.txt`，首次启动自动生成，安装脚本最后会打印）。
   登录一次记 30 天；每个 IP 每小时最多试 20 次口令。
   按排查码、称呼、电脑名、手机、IP 搜索；报告页有「纯文本日志」和「原始 JSON」两个

@@ -52,7 +52,12 @@ TOKEN_FILE = PACKAGING_DIR / "gitee_token.txt"
 DEFAULT_REPO = "lizupingsama/Farm-Automation-Assistant"
 
 sys.path.insert(0, str(ROOT))
+import wzry_logupload  # noqa: E402  (日志上传地址文件的读法与客户端共用一份)
 import wzry_updater  # noqa: E402  (清单/分包逻辑与客户端共用一份)
+
+# 日志上传地址：仓库是公开的，服务器地址不进源码，只放在这个不入库的本地文件里，
+# 构建时复制到发布包根目录（根目录文件才会随在线更新下发）
+LOG_UPLOAD_URL_FILE = ROOT / wzry_logupload.URL_FILE
 
 ADB_FILES_REQUIRED = ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"]
 ADB_FILES_OPTIONAL = ["libwinpthread-1.dll", "NOTICE.txt", "source.properties"]
@@ -247,7 +252,22 @@ def normalize_base_library():
     log("base_library.zip 条目已按字典序规范化")
 
 
-def copy_data(adb_dir):
+def check_log_upload_url(args):
+    """早失败：发出去的包没有上传地址，所有人的「上传日志」都会失效。"""
+    if args.no_log_upload:
+        log("⚠️ --no-log-upload：发布包不带日志上传地址，上传功能不可用")
+        return
+    if not wzry_logupload.read_url_file(LOG_UPLOAD_URL_FILE):
+        raise SystemExit(
+            f"缺少日志上传地址：在项目根目录新建 {LOG_UPLOAD_URL_FILE.name}，"
+            "写一行 http://<服务器>:8421/api/logs（该文件已被 gitignore，不会入库）；"
+            "确实不要上传功能就加 --no-log-upload"
+        )
+    if args.skip_build and not wzry_logupload.read_url_file(APP_DIR / LOG_UPLOAD_URL_FILE.name):
+        raise SystemExit(f"--skip-build 的现成目录里缺 {LOG_UPLOAD_URL_FILE.name}，请重新构建")
+
+
+def copy_data(adb_dir, log_upload=True):
     src_templates = ROOT / "assets" / "templates"
     dst_templates = APP_DIR / "assets" / "templates"
     if dst_templates.exists():
@@ -258,6 +278,13 @@ def copy_data(adb_dir):
     shutil.copy2(ROOT / "stats.html", APP_DIR / "stats.html")
     shutil.copy2(PACKAGING_DIR / "使用说明.txt", APP_DIR / "使用说明.txt")
     log("stats.html / 使用说明.txt 已复制")
+
+    url_dst = APP_DIR / LOG_UPLOAD_URL_FILE.name
+    if log_upload:
+        shutil.copy2(LOG_UPLOAD_URL_FILE, url_dst)
+        log(f"日志上传地址已写入发布包（{url_dst.name}）")
+    elif url_dst.exists():
+        url_dst.unlink()
 
     if adb_dir:
         dst = APP_DIR / "platform-tools"
@@ -526,6 +553,8 @@ def main():
                         help="发布在线更新到目录（局域网共享 / 静态网站根目录）")
     parser.add_argument("--notes", help="本次更新说明；缺省取上次发布以来的 git log")
     parser.add_argument("--repo", help=f"Gitee 仓库 owner/repo（默认 {DEFAULT_REPO}）")
+    parser.add_argument("--no-log-upload", action="store_true",
+                        help=f"不带日志上传地址构建（缺 {wzry_logupload.URL_FILE} 时默认拒绝构建）")
     parser.add_argument("--skip-build", action="store_true",
                         help="跳过构建，直接用现有 dist 目录发布（补发/调试用）")
     args = parser.parse_args()
@@ -539,6 +568,7 @@ def main():
     repo = args.repo or state.get("gitee_repo") or DEFAULT_REPO
     if args.publish:
         gitee_token()  # 早失败：没配 token 就不必花几分钟构建了
+    check_log_upload_url(args)
 
     if args.skip_build:
         if not (APP_DIR / "农场助手.exe").exists():
@@ -559,7 +589,7 @@ def main():
         ensure_pyinstaller()
         make_icon()
         run_pyinstaller()
-        copy_data(adb_dir)
+        copy_data(adb_dir, log_upload=not args.no_log_upload)
         selftest()
 
     version, build_num = next_version(state)
