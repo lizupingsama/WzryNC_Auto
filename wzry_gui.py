@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
 
+import wzry_logupload
 import wzry_updater
 
 # PyInstaller 打包后 __file__ 指向内部资源目录，改用 exe 所在目录；
@@ -196,6 +198,9 @@ class FarmGui:
         self._update_info = None
         self._upd_cancel = None
         self._upd_win = None
+        self._log_upload_busy = False
+        self._log_upload_win = None
+        self._log_upload_failing = False   # 自动上传连续失败只在日志里提示一次
 
         self.config = self._load_config()
         self._appearance = self._initial_appearance()
@@ -234,6 +239,7 @@ class FarmGui:
                 f"[更新] ✅ 已从 v{updated_from or '?'} 更新到 v{APP_VERSION or '?'}\n"
             ))
         self._schedule_auto_update_check()
+        self._schedule_auto_log_upload()
 
     def _initial_appearance(self):
         """新配置读 appearance；兼容旧配置的 dark_mode；都没有则跟随系统。"""
@@ -548,6 +554,26 @@ class FarmGui:
             switch_height=16, switch_width=36,
             command=self._on_collapse_toggle,
         ).pack(side="right")
+        # 日志上传：出问题时点一下把最近 50 轮日志发给作者；另外每小时自动传一次
+        self.auto_log_upload_var = tk.BooleanVar(
+            value=bool(self.config.get("auto_log_upload", True))
+        )
+        ctk.CTkSwitch(
+            log_bar, text="每小时自动上传", variable=self.auto_log_upload_var,
+            onvalue=True, offvalue=False, font=self.font_small,
+            switch_height=16, switch_width=36,
+            command=self._save_config,
+        ).pack(side="right", padx=(0, 16))
+        self.btn_upload_log = ctk.CTkButton(
+            log_bar, text="上传日志", width=76, height=24, font=self.font_small,
+            command=self.open_log_upload_dialog,
+            fg_color="transparent", border_width=1,
+            border_color=("gray60", "gray35"),
+            text_color=("gray20", "gray80"),
+            hover_color=("gray85", "gray25"),
+            text_color_disabled=("gray45", "gray55"),
+        )
+        self.btn_upload_log.pack(side="right", padx=(0, 12))
         self.log_text = ctk.CTkTextbox(
             self.root, corner_radius=12, font=self.font_mono,
             wrap="word", state="disabled",
@@ -996,6 +1022,7 @@ class FarmGui:
             ),
             pystray.MenuItem("立刻务农", lambda *a: self.cmd_queue.put(("farm_now", None))),
             pystray.MenuItem("统计面板", lambda *a: self.cmd_queue.put(("stats", None))),
+            pystray.MenuItem("上传日志", lambda *a: self.cmd_queue.put(("upload_log", None))),
             pystray.MenuItem(
                 "检查更新", lambda *a: self.cmd_queue.put(("check_update", None)),
                 visible=self._updates_supported(),
@@ -1334,6 +1361,10 @@ class FarmGui:
                     self.quit_app()
                 elif kind == "check_update":
                     self.check_updates()
+                elif kind == "upload_log":
+                    self.open_log_upload_dialog()
+                elif kind == "log_upload_done":
+                    self._on_log_upload_done(*payload)
                 elif kind == "upd_checked":
                     self._on_update_checked(*payload)
                 elif kind == "upd_progress":
@@ -1876,6 +1907,221 @@ class FarmGui:
         self._cancel_restart()
         self._finish_quit()
 
+    # ------------------------------------------------------------
+    # 日志上传（排查用，见 wzry_logupload.py）
+    # ------------------------------------------------------------
+    LOG_UPLOAD_FIRST = 5 * 60_000       # 启动后首次自动上传 (ms)
+    LOG_UPLOAD_INTERVAL = 3600_000      # 之后每小时一次 (ms)
+
+    def _log_client_id(self):
+        """本机的上传身份，首次使用时生成并存进配置；排查码就是它的前 8 位。"""
+        client_id = str(self.config.get("log_client_id") or "")
+        if not wzry_logupload.is_client_id(client_id):
+            client_id = uuid.uuid4().hex
+            self.config["log_client_id"] = client_id
+            self._save_config()
+        return client_id
+
+    def _schedule_auto_log_upload(self):
+        # 日志没变就不传（等下一轮浇水的几个小时里常是这样），见 _log_upload_worker
+        def tick():
+            if self._quitting:
+                return
+            if self.auto_log_upload_var.get():
+                self.upload_logs(auto=True)
+            self.root.after(self.LOG_UPLOAD_INTERVAL, tick)
+
+        self.root.after(self.LOG_UPLOAD_FIRST, tick)
+
+    def open_log_upload_dialog(self):
+        """手动上传：可以留个称呼和问题描述，传完把排查码发给作者。"""
+        if self._log_upload_win is not None and self._log_upload_win.winfo_exists():
+            self._log_upload_win.lift()
+            self._log_upload_win.focus_force()
+            return
+        self.show_window()
+        win = ctk.CTkToplevel(self.root)
+        self._log_upload_win = win
+        win.title("上传日志")
+        win.resizable(False, False)
+        win.transient(self.root)
+        code = wzry_logupload.short_code(self._log_client_id())
+        ctk.CTkLabel(
+            win, justify="left", anchor="w", font=self.font_small,
+            text=(
+                "会把最近 50 轮务农日志、最近 5 次失败现场（游戏截图和那一轮\n"
+                "的日志）和排查信息发给作者：电脑名、IP、手机型号与系统、adb 状态、\n"
+                "助手设置（锁屏密码不会上传）。上传后把排查码告诉作者即可。"
+            ),
+        ).pack(fill="x", padx=16, pady=(14, 4))
+        ctk.CTkLabel(
+            win, text=f"排查码  {code}", anchor="w",
+            font=self.font_title, text_color=ACCENT,
+        ).pack(fill="x", padx=16, pady=(2, 8))
+
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=4)
+        ctk.CTkLabel(row, text="称呼", width=64, anchor="w", font=self.font_body).pack(side="left")
+        nickname_entry = ctk.CTkEntry(
+            row, font=self.font_body, placeholder_text="选填，方便作者认出你",
+        )
+        saved_nickname = str(self.config.get("log_nickname", "")).strip()
+        if saved_nickname:
+            nickname_entry.insert(0, saved_nickname)
+        nickname_entry.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkLabel(
+            win, text="遇到了什么问题（选填）", anchor="w", font=self.font_body,
+        ).pack(fill="x", padx=16, pady=(8, 2))
+        note_box = ctk.CTkTextbox(win, width=400, height=90, font=self.font_body, wrap="word")
+        note_box.pack(fill="x", padx=16)
+
+        def submit():
+            nickname = nickname_entry.get().strip()[:40]
+            note = note_box.get("1.0", "end").strip()[:2000]
+            if nickname != saved_nickname:
+                self.config["log_nickname"] = nickname
+                self._save_config()
+            win.destroy()
+            self.upload_logs(auto=False, note=note)
+
+        ctk.CTkButton(win, text="上传", width=120, font=self.font_body, command=submit).pack(
+            pady=(12, 14),
+        )
+        win.after(120, win.focus_force)
+
+    def upload_logs(self, auto=False, note=""):
+        """收集并上传日志。界面上的东西在主线程取好，采集和上传放后台线程。"""
+        if self._log_upload_busy:
+            if not auto:
+                self._append_log("[日志上传] 上一次上传还没结束，请稍候\n")
+            return
+        self._log_upload_busy = True
+        self.btn_upload_log.configure(state="disabled", text="上传中…")
+        if not auto:
+            self._append_log("[日志上传] 正在收集并上传日志 ...\n")
+        snapshot = {
+            "auto": auto,
+            "note": note,
+            "client_id": self._log_client_id(),
+            "nickname": str(self.config.get("log_nickname", "")),
+            "config": dict(self.config),
+            "last_fp": str(self.config.get("log_upload_fp", "")),
+            "preferred": self._normalize_wireless_addr(
+                self._entry_text("device_entry", "wireless_device")
+            ),
+            "gui_log": "\n".join(
+                self.log_text.get("1.0", "end-1c").splitlines()[-wzry_logupload.GUI_LOG_LINES:]
+            ),
+            "gui": {
+                "status": self.status_var.get().lstrip("● ").strip(),
+                "device_status": self.device_status_var.get().lstrip("● ").strip(),
+                "running": self._running,
+                "paused": self._paused,
+                "update_state": self._update_state,
+            },
+        }
+        threading.Thread(
+            target=self._log_upload_worker, args=(snapshot,), daemon=True, name="log-upload",
+        ).start()
+
+    def _log_upload_worker(self, snap):
+        run_log = default_log_file()
+        fp = wzry_logupload.fingerprint(run_log, ERROR_LOG)
+        if snap["auto"] and fp == snap["last_fp"]:
+            # 上次传完以后日志一行没多：再传一份一模一样的只是占服务器空间
+            self.cmd_queue.put(("log_upload_done", (snap, None, None, None)))
+            return
+        try:
+            adb_path = os.environ.get("WZRY_ADB") or "adb"
+            adb = wzry_logupload.collect_adb_info(self._adb_run, adb_path)
+            serial, state = self._choose_device(
+                self._parse_adb_devices(adb.get("devices", "")), snap["preferred"],
+            )
+            phone = (
+                wzry_logupload.collect_phone_info(self._adb_run, serial, state)
+                if serial else {}
+            )
+            report = wzry_logupload.build_report(
+                client_id=snap["client_id"],
+                reason="auto" if snap["auto"] else "manual",
+                nickname=snap["nickname"],
+                note=snap["note"],
+                app={"version": APP_VERSION, "frozen": IS_FROZEN, "dir": str(SCRIPT_DIR)},
+                gui=snap["gui"],
+                config=snap["config"],
+                gui_log=snap["gui_log"],
+                run_log_path=run_log,
+                stats_path=STATS_FILE,
+                error_log_path=ERROR_LOG,
+                diagnostics_dir=SCRIPT_DIR / "diagnostics",
+                adb=adb,
+                phone=phone,
+            )
+            body = wzry_logupload.encode_report(report)
+            url = wzry_logupload.upload_url(snap["config"])
+            receipt = wzry_logupload.upload(body, url, APP_VERSION)
+        except Exception as exc:
+            self.cmd_queue.put(("log_upload_done", (snap, None, None, exc)))
+            return
+        # 报告已经传上去了；截图按回执补传服务器还没有的，失败只记下不算整体失败
+        allowed = {d["name"] for d in report["diagnostics"] if d.get("shot")}
+        receipt["shots_sent"], receipt["shots_failed"] = wzry_logupload.upload_shots(
+            url, snap["client_id"], receipt.get("need_shots"),
+            SCRIPT_DIR / "diagnostics", APP_VERSION, allowed=allowed,
+        )
+        self.cmd_queue.put(("log_upload_done", (snap, receipt, fp, None)))
+
+    def _on_log_upload_done(self, snap, receipt, fp, error):
+        self._log_upload_busy = False
+        try:
+            self.btn_upload_log.configure(state="normal", text="上传日志")
+        except tk.TclError:
+            pass
+        auto = snap["auto"]
+        if error is not None:
+            message = str(error) or type(error).__name__
+            if not auto:
+                self._append_log(f"[日志上传] ❌ 上传失败: {message}\n")
+                messagebox.showerror(APP_TITLE, f"日志上传失败:\n{message}")
+                return
+            if not self._log_upload_failing:
+                self._append_log(
+                    f"[日志上传] ⚠️ 自动上传失败: {message}（之后照常每小时重试）\n"
+                )
+            self._log_upload_failing = True
+            return
+        if receipt is None:
+            return  # 自动上传发现日志没变，跳过
+        self._log_upload_failing = False
+        self.config["log_upload_fp"] = fp
+        self._save_config()
+        code = receipt.get("code") or wzry_logupload.short_code(snap["client_id"])
+        shots_sent = receipt.get("shots_sent", 0)
+        shots_failed = receipt.get("shots_failed") or []
+        if shots_failed:
+            name, why = shots_failed[0]
+            self._append_log(
+                f"[日志上传] ⚠️ {len(shots_failed)} 张失败现场截图没传上（{name}: {why}），"
+                "下次上传会再补\n"
+            )
+        if auto:
+            # 文本固定不带时间，「合并重复」开着时每小时只在原行累加 ×N
+            self._append_log("[日志上传] 已自动上传最近的运行日志\n")
+            return
+        shots_note = f"，附带 {shots_sent} 张新的失败截图" if shots_sent else ""
+        self._append_log(f"[日志上传] ✅ 上传成功{shots_note}，排查码 {code}\n")
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(code)
+        except tk.TclError:
+            pass
+        messagebox.showinfo(
+            APP_TITLE,
+            f"日志已上传。\n\n排查码：{code}（已复制到剪贴板）\n"
+            "把排查码发给作者，就能查到这份日志。",
+        )
+
     def _load_config(self):
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -1902,6 +2148,7 @@ class FarmGui:
             "wireless_device": self._entry_text("device_entry", "wireless_device"),
             "unlock_pwd": self._entry_text("pwd_entry", "unlock_pwd"),
             "log_collapse": bool(self.collapse_var.get()),
+            "auto_log_upload": bool(self.auto_log_upload_var.get()),
             # 界面没有对应开关，写回来只是为了让这个键在配置文件里看得见，
             # 想强制开/关拖动时收内容的人知道该改哪儿（auto / on / off）
             "smooth_resize": str(self.config.get("smooth_resize", "auto")),

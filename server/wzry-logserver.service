@@ -1,0 +1,21 @@
+[Unit]
+Description=WzryFarm log upload server
+After=network.target
+
+[Service]
+# 临时系统用户跑，数据落在 /var/lib/wzry-logserver；报告总占用上限 1 GB
+DynamicUser=yes
+StateDirectory=wzry-logserver
+Environment=PYTHONIOENCODING=utf-8 PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/wzry-logserver/log_server.py --port 8421 --data /var/lib/wzry-logserver --max-mb 1024
+Restart=always
+RestartSec=5
+# 服务器内存小，给个硬顶，出问题宁可自己被杀也别拖垮别的服务
+MemoryLimit=160M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
