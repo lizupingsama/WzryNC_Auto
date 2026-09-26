@@ -540,14 +540,25 @@ def infer_crop_cycle(remain_min, fresh=False):
     return min(candidates)[1]
 
 
+def _configured_tier_min():
+    """界面或环境变量指定的作物档位；未指定或无效时返回 None。"""
+    raw = os.environ.get("WZRY_CROP_CYCLE_MIN")
+    try:
+        value = int(raw) if raw not in (None, "") else None
+    except (TypeError, ValueError):
+        value = None
+    return value if value in WATER_PLANS else None
+
+
 def calculate_next_water_time(
     show_mature_time, now=None, save_if_fresh=False, cycle_min=None
 ):
     """结合原始作物档位和每轮浇水减时，计算下次浇水（或收获）时间。
 
-    图形界面选择的档位（WZRY_CROP_CYCLE_MIN）优先；终端模式未指定时，
-    新播种根据首次浇水后的剩余时间识别并保存原始档位，后续轮次始终
-    使用该档位。档位内取小于等于当前剩余时间的最大节点。
+    图形界面选择的档位（WZRY_CROP_CYCLE_MIN）优先于手机存档；终端模式
+    未指定时才用存档档位。仍没有档位时，新播种根据首次浇水后的剩余时间
+    识别并保存原始档位，后续轮次始终使用该档位。档位内取小于等于当前
+    剩余时间的最大节点。
     :param show_mature_time: 本次浇水后 OCR 读到的成熟时间 (datetime)
     :param now: 当前时间，缺省取 datetime.now()（测试注入用）
     :param save_if_fresh: 本轮收获并重新播种，需重新识别和保存作物档位
@@ -561,17 +572,19 @@ def calculate_next_water_time(
 
     selected_cycle = cycle_min
     source = "指定档位"
-    if selected_cycle is None and _archive_tier_min is not None:
-        # 手机存档优先于界面选择：换电脑接力时，别被新电脑界面上的默认档位带偏
-        selected_cycle = _archive_tier_min
-        source = "手机存档档位"
-    if selected_cycle is None:
-        selected_cycle = os.environ.get("WZRY_CROP_CYCLE_MIN")
-        source = "界面选择档位"
     try:
         selected_cycle = int(selected_cycle) if selected_cycle is not None else None
     except (TypeError, ValueError):
         selected_cycle = None
+    if selected_cycle not in WATER_PLANS:
+        # 界面选择优先：换作物或换电脑后，以当前界面档位算浇水节点
+        gui_cycle = _configured_tier_min()
+        if gui_cycle in WATER_PLANS:
+            selected_cycle = gui_cycle
+            source = "界面选择档位"
+        elif _archive_tier_min in WATER_PLANS:
+            selected_cycle = _archive_tier_min
+            source = "手机存档档位"
 
     if selected_cycle in WATER_PLANS:
         tier_min = selected_cycle
@@ -1938,7 +1951,7 @@ ARCHIVE_TIME_FMT = "%Y-%m-%d %H:%M:%S"
 ARCHIVE_STALE_SECONDS = 24 * 3600
 
 DEVICE_ID = ""            # 手机唯一识别码，存档按它归属
-_archive_tier_min = None  # 从存档恢复出的作物档位，本次会话内优先于界面选择
+_archive_tier_min = None  # 无界面选择时，从存档恢复的作物档位
 
 
 def archive_enabled():
@@ -2051,14 +2064,12 @@ def load_device_archive(retries=1):
 
 
 def current_tier_min():
-    """本次会话实际在用的作物档位：存档 > 界面选择 > 本地记录。"""
-    for value in (_archive_tier_min, os.environ.get("WZRY_CROP_CYCLE_MIN")):
-        try:
-            tier = int(value) if value else None
-        except (TypeError, ValueError):
-            tier = None
-        if tier in WATER_PLANS:
-            return tier
+    """本次会话实际在用的作物档位：界面选择 > 存档 > 本地记录。"""
+    chosen = _configured_tier_min()
+    if chosen in WATER_PLANS:
+        return chosen
+    if _archive_tier_min in WATER_PLANS:
+        return _archive_tier_min
     return load_crop_cycle()
 
 
@@ -2195,18 +2206,16 @@ def restore_device_archive(reread=False):
         return False
 
     tier_min = data.get("tier_min")
-    if tier_min in WATER_PLANS:
+    chosen = _configured_tier_min()
+    if chosen in WATER_PLANS:
+        # 浇水节点按界面档位算；存档只负责接力到下一个浇水时刻
+        if tier_min in WATER_PLANS and tier_min != chosen:
+            print(f"  🌱 浇水档位按界面选择:{chosen // 60} 小时档"
+                  f"（存档记录 {tier_min // 60} 小时档，本次不采用）")
+    elif tier_min in WATER_PLANS:
         _archive_tier_min = tier_min
         save_crop_cycle(tier_min)
         print(f"  🌱 按存档恢复作物档位:{tier_min // 60} 小时档")
-        chosen = os.environ.get("WZRY_CROP_CYCLE_MIN")
-        try:
-            chosen = int(chosen) if chosen else None
-        except ValueError:
-            chosen = None
-        if chosen in WATER_PLANS and chosen != tier_min:
-            print(f"     界面选的 {chosen // 60} 小时档本次不生效（存档优先）；"
-                  "要按界面重新开始请关掉「手机存档接力」")
 
     if wait_seconds <= 0:
         print(f"  ⏰ 存档里的「{reason}」时间已过，立即开始务农")

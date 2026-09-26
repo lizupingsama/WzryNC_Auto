@@ -748,7 +748,9 @@ class DeviceArchiveTests(unittest.TestCase):
         self.stats = tracker.start()
         self.stats.rounds = 7
         self.addCleanup(tracker.stop)
-        env = patch.dict(os.environ, {"WZRY_DEVICE_ARCHIVE": "1"})
+        env = patch.dict(
+            os.environ, {"WZRY_DEVICE_ARCHIVE": "1", "WZRY_CROP_CYCLE_MIN": ""}
+        )
         env.start()
         self.addCleanup(env.stop)
 
@@ -908,16 +910,39 @@ class DeviceArchiveTests(unittest.TestCase):
         load.assert_not_called()
         write.assert_not_called()
 
-    def test_archived_tier_beats_gui_selection(self):
-        # 换电脑接力时，新电脑界面上残留的默认 8 小时档不能把 16 小时作物带偏
+    def test_gui_selection_beats_archived_tier(self):
+        # 界面选了 8 小时档时，存档里的 16 小时档不能把浇水节点带偏
         now = datetime(2026, 8, 26, 10, 0, 0)
         with patch.object(wzry_auto, "_archive_tier_min", 960), \
              patch.dict(os.environ, {"WZRY_CROP_CYCLE_MIN": "480"}):
             result = wzry_auto.calculate_next_water_time(
                 now + timedelta(minutes=480), now=now
             )
+        self.assertEqual(result["tier_min"], 480)
+        self.assertEqual(result["node_min"], 280)
+
+    def test_archived_tier_used_when_gui_is_unset(self):
+        now = datetime(2026, 8, 26, 10, 0, 0)
+        with patch.object(wzry_auto, "_archive_tier_min", 960), \
+             patch.dict(os.environ, {"WZRY_CROP_CYCLE_MIN": ""}):
+            result = wzry_auto.calculate_next_water_time(
+                now + timedelta(minutes=480), now=now
+            )
         self.assertEqual(result["tier_min"], 960)
         self.assertEqual(result["node_min"], 160)
+
+    def test_restore_keeps_gui_tier_over_archive(self):
+        with patch.dict(os.environ, {"WZRY_CROP_CYCLE_MIN": "480"}), \
+             patch.object(
+                 wzry_auto, "load_device_archive", return_value=self._archive()
+             ), \
+             patch.object(wzry_auto, "_device_epoch", return_value=1_758_400_000), \
+             patch.object(wzry_auto, "wait_or_farm_now") as wait:
+            self.assertTrue(wzry_auto.restore_device_archive())
+        # 浇水时刻仍按存档等，档位不从存档盖掉界面选择
+        self.assertAlmostEqual(wait.call_args[0][0], 3600, delta=2)
+        self.assertIsNone(wzry_auto._archive_tier_min)
+        wzry_auto.save_crop_cycle.assert_not_called()
 
     def test_device_id_falls_back_to_serial_number(self):
         with patch.object(wzry_auto, "adb_shell", side_effect=["null\n", "YP9TU\n"]):
