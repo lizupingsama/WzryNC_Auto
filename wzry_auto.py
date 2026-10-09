@@ -182,6 +182,8 @@ TEMPLATE_ROIS = {
     "close_popup_event.png": (0.70, 0.03, 0.96, 0.30),
     # KPL 观赛直播弹窗右上角的海星样式 ✕（实测 3200x1440 中心 (2807,157)）
     "close_popup_kpl.png": (0.70, 0.03, 0.96, 0.30),
+    # KPL 总决赛弹窗改用金色菱形 ✕，位置同旧观赛弹窗，需独立模板。
+    "close_popup_kpl_final.png": (0.70, 0.03, 0.96, 0.30),
     # 通用对话框居中「确定」（如健康系统休息提醒）。右界 0.56 保证同排的
     # 「帮助/前往营地」连完整匹配窗口都放不进搜索区，永远不会被误点
     "dialog_confirm.png": (0.44, 0.58, 0.56, 0.72),
@@ -202,6 +204,7 @@ TEMPLATE_THRESHOLDS = {
     # 两张失败现场正样本均 1.000，全部参考截图噪声上限 0.544；
     # 与 close_popup_event 同取 0.78，给跨分辨率高度缩放复用留余量
     "close_popup_kpl.png": 0.78,
+    "close_popup_kpl_final.png": 0.85,
     # 正样本 1.000，噪声上限 0.266；按钮样式通用，靠 ROI 排除同排其他按钮
     "dialog_confirm.png": 0.85,
     "agree_terms.png": 0.85,
@@ -219,6 +222,7 @@ LOBBY_POPUP_CLOSERS = [
     "close_popup.png",
     "close_popup_event.png",
     "close_popup_kpl.png",
+    "close_popup_kpl_final.png",
     "dialog_confirm.png",
 ]
 

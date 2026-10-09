@@ -78,6 +78,26 @@ class TemplateMatchingTests(unittest.TestCase):
             )
             self.assertIsNone(result, name)
 
+    def test_kpl_final_popup_close_matches_at_real_position(self):
+        # 2026-10-09 总决赛弹窗改用金色菱形关闭钮，旧海星模板无法识别。
+        result = wzry_auto.find_any_template(
+            wzry_auto.LOBBY_POPUP_CLOSERS,
+            str(ROOT / "assets" / "screenshots" / "3200x1440_kpl_final_popup.png"),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["template"], "close_popup_kpl_final.png")
+        self.assertEqual((result["x"], result["y"]), (2807, 159))
+
+    def test_kpl_final_popup_close_absent_on_other_reference_screens(self):
+        for screenshot in sorted((ROOT / "assets" / "screenshots").glob("*.png")):
+            if screenshot.name == "3200x1440_kpl_final_popup.png":
+                continue
+            with self.subTest(screenshot=screenshot.name):
+                result = wzry_auto.find_template(
+                    "close_popup_kpl_final.png", str(screenshot)
+                )
+                self.assertIsNone(result)
+
     def test_dialog_confirm_matches_on_rest_reminder(self):
         # 健康系统「呵护双眼」休息提醒只有 确定/帮助/前往营地 三键、无 ✕；
         # 模板取自 3200x1440 失败现场，「确定」中心位于 (1595,928)
@@ -109,6 +129,7 @@ class TemplateMatchingTests(unittest.TestCase):
         # 实测 KPL✕ 0.987/0.994、确定钮 0.987/0.975，均远超阈值
         cases = [
             ("close_popup_kpl.png", "3200x1440_kpl_live_popup.png", (2807, 157)),
+            ("close_popup_kpl_final.png", "3200x1440_kpl_final_popup.png", (2807, 159)),
             ("dialog_confirm.png", "3200x1440_rest_reminder_popup.png", (1595, 928)),
         ]
         for width, height in ((2510, 1156), (2400, 1080)):
@@ -138,8 +159,9 @@ class TemplateMatchingTests(unittest.TestCase):
                 )
 
     def test_lobby_popup_closers_cover_new_popups(self):
-        # 步骤3/4/5 共用的弹窗关闭清单必须包含两类新弹窗
+        # 步骤3/4/5 共用的弹窗关闭清单必须覆盖各款赛事弹窗和休息提醒。
         self.assertIn("close_popup_kpl.png", wzry_auto.LOBBY_POPUP_CLOSERS)
+        self.assertIn("close_popup_kpl_final.png", wzry_auto.LOBBY_POPUP_CLOSERS)
         self.assertIn("dialog_confirm.png", wzry_auto.LOBBY_POPUP_CLOSERS)
 
     def test_agree_terms_matches_at_real_position(self):
