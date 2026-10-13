@@ -1,12 +1,12 @@
 {
-  "last_commit": "56b76a9708e8418fcddd983516262f55fdda548b",
-  "last_version": "20261013-1",
-  "last_build": 2026101301,
-  "runtime_key": "695743d2dc717b7fd35d4514b736a2c7f5233320db076441ac16c06a180144d6",
+  "last_commit": "81691f89e69cb8c8df22401833e06a023ef04dbc",
+  "last_version": "20261013-2",
+  "last_build": 2026101302,
+  "runtime_key": "070b4aa4840b1c89d4390b55d313881419e05e44608256f68c64763439c6ebcb",
   "runtime_pack": {
-    "name": "runtime_20261013-1.zip",
-    "sha256": "07c4de4d918a23591cf1fbe3fdfe86b97405cc3b20d3cdca88a241f168eb74bc",
-    "size": 78098350,
+    "name": "runtime_20260827-3.zip",
+    "sha256": "d5a8f7159a1aad586cb88b5bcfb37df0e35396c133187c11cab72dab5c6afc7d",
+    "size": 77978621,
     "files": [
       "_internal/MSVCP140_1.dll",
       "_internal/PIL/_avif.cp312-win_amd64.pyd",
@@ -961,14 +961,12 @@
       "_internal/api-ms-win-core-debug-l1-1-0.dll",
       "_internal/api-ms-win-core-errorhandling-l1-1-0.dll",
       "_internal/api-ms-win-core-fibers-l1-1-0.dll",
-      "_internal/api-ms-win-core-fibers-l1-1-1.dll",
       "_internal/api-ms-win-core-file-l1-1-0.dll",
       "_internal/api-ms-win-core-file-l1-2-0.dll",
       "_internal/api-ms-win-core-file-l2-1-0.dll",
       "_internal/api-ms-win-core-handle-l1-1-0.dll",
       "_internal/api-ms-win-core-heap-l1-1-0.dll",
       "_internal/api-ms-win-core-interlocked-l1-1-0.dll",
-      "_internal/api-ms-win-core-kernel32-legacy-l1-1-1.dll",
       "_internal/api-ms-win-core-libraryloader-l1-1-0.dll",
       "_internal/api-ms-win-core-localization-l1-2-0.dll",
       "_internal/api-ms-win-core-memory-l1-1-0.dll",
@@ -982,7 +980,6 @@
       "_internal/api-ms-win-core-synch-l1-1-0.dll",
       "_internal/api-ms-win-core-synch-l1-2-0.dll",
       "_internal/api-ms-win-core-sysinfo-l1-1-0.dll",
-      "_internal/api-ms-win-core-sysinfo-l1-2-0.dll",
       "_internal/api-ms-win-core-timezone-l1-1-0.dll",
       "_internal/api-ms-win-core-util-l1-1-0.dll",
       "_internal/api-ms-win-crt-conio-l1-1-0.dll",
@@ -1176,7 +1173,7 @@
       "platform-tools/libwinpthread-1.dll",
       "platform-tools/source.properties"
     ],
-    "url": "https://gitee.com/lizupingsama/Farm-Automation-Assistant/releases/download/v20261013-1/runtime_20261013-1.zip"
+    "url": "https://gitee.com/lizupingsama/Farm-Automation-Assistant/releases/download/v20260827-3/runtime_20260827-3.zip"
   },
   "gitee_repo": "lizupingsama/Farm-Automation-Assistant"
 }
