@@ -18,6 +18,7 @@
   然后设置环境变量 GITEE_TOKEN，或写入 packaging/gitee_token.txt（已被 gitignore）。
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -250,6 +251,59 @@ def normalize_base_library():
             out.writestr(info, data)
     os.replace(tmp, target)
     log("base_library.zip 条目已按字典序规范化")
+
+
+def reuse_runtime_build_noise(pack):
+    """依赖内容不变时保留已发布的系统 DLL/安装元数据，避免无效运行库更新。"""
+    if not pack:
+        return False
+    cached = next((path for path in (
+        PACKS_DIR / pack["name"], ROOT / "dist" / "packs" / pack["name"],
+    ) if path.is_file()), None)
+    if cached is None or wzry_updater.sha256_file(cached) != pack["sha256"]:
+        log("旧运行库缓存缺失或校验不符，按当前构建生成运行库")
+        return False
+
+    def build_noise(rel):
+        parts = rel.split("/")
+        if len(parts) == 2 and parts[0] == "_internal":
+            return (parts[1].startswith("api-ms-win-") and parts[1].endswith(".dll")) \
+                or parts[1] == "ucrtbase.dll"
+        return len(parts) == 3 and parts[0] == "_internal" \
+            and parts[1].endswith(".dist-info") and parts[2] == "RECORD"
+
+    with zipfile.ZipFile(cached) as bundle:
+        names = {info.filename for info in bundle.infolist() if not info.is_dir()}
+        if names != set(pack["files"]):
+            raise SystemExit("旧运行库缓存的文件清单与发布记录不符")
+        for rel in names:
+            if wzry_updater._safe_rel(rel) != rel or not rel.startswith(wzry_updater.RUNTIME_PREFIXES):
+                raise SystemExit(f"旧运行库缓存包含非法路径: {rel}")
+        previous = {rel: hashlib.sha256(bundle.read(rel)).hexdigest() for rel in names}
+        current = {
+            rel: wzry_updater.sha256_file(path)
+            for rel, path in wzry_updater.scan_release_files(APP_DIR).items()
+            if rel.startswith(wzry_updater.RUNTIME_PREFIXES)
+        }
+        changed = {rel for rel in names | current.keys() if previous.get(rel) != current.get(rel)}
+        if not changed:
+            return False
+        if any(not build_noise(rel) for rel in changed):
+            log("运行库依赖内容有变化，保留当前构建并生成新分包")
+            return False
+        # 仅覆盖/删除刚生成的发布目录里的文件；自检会在还原后执行。
+        app_root = APP_DIR.resolve()
+        for rel in sorted(changed):
+            target = (APP_DIR / rel).resolve()
+            if not target.is_relative_to(app_root):
+                raise SystemExit(f"运行库目标路径越界: {rel}")
+            if rel in previous:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(bundle.read(rel))
+            else:
+                target.unlink()
+    log(f"依赖内容未变，复用已发布运行库的 {len(changed)} 个系统 DLL/安装元数据差异")
+    return True
 
 
 def check_log_upload_url(args):
@@ -590,7 +644,9 @@ def main():
         make_icon()
         run_pyinstaller()
         copy_data(adb_dir, log_upload=not args.no_log_upload)
-        selftest()
+
+    reuse_runtime_build_noise(state.get("runtime_pack"))
+    selftest()
 
     version, build_num = next_version(state)
     if args.publish:

@@ -284,6 +284,8 @@ venv\Scripts\python packaging\build_release.py --publish
   `app_版本.zip`（两个 exe + 模板 + 页面，约 10MB，每次发布都上传）、
   `runtime_版本.zip`（`_internal` + `platform-tools`，约 80MB，
   仅依赖变化导致内容变动时才重新上传，平时直接复用旧版本的附件）
+- 构建时若差异仅来自 Windows 系统 DLL 或安装元数据，会校验本地缓存并保留
+  已发布运行库，再执行打包自检；实际依赖有变化时仍生成新的运行库分包。
 - 发布即在 Gitee 仓库创建一个 Release（tag 如 `v20260827-1`），
   把 manifest 和分包传为附件；客户端匿名走 Gitee API 检查最新版
 - 客户端逐文件对比哈希，只下载覆盖差异的分包、只解压需要的文件，
