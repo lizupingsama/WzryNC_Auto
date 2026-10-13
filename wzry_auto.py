@@ -1407,56 +1407,52 @@ def read_harvest_info(screenshot_path):
 def step1_check_status():
     """步骤1: 检测APP是否在前台"""
     print("\n[步骤1] 检测状态...")
-    
-    found = False
-    found2 = False
-    found3 = False
+    last_timeout = None
+    in_foreground = None
     for attempt in range(3):
-        # 方法1: 精确匹配ResumedActivity行（不在历史/缓存中误匹配）
-        out = adb_shell("dumpsys activity activities")
-        found = False
-        for line in out.splitlines():
-            stripped = line.strip()
-            if ("ResumedActivity" in stripped or "topResumedActivity" in stripped) and GAME_PKG in stripped:
-                found = True
+        # 只读系统维护的前台记录，不调用 activity top：后者会向应用请求
+        # dump，手机上即使桌面在前台、ADB 连接正常也可能一直卡住。
+        for cmd, markers in (
+            ("dumpsys activity activities", ("ResumedActivity", "topResumedActivity")),
+            ("dumpsys window", ("mCurrentFocus", "mFocusedApp")),
+        ):
+            try:
+                out = adb_shell(cmd)
+            except subprocess.TimeoutExpired as exc:
+                last_timeout = exc
+                print(f"  ⚠️ 前台查询超时（{cmd}），尝试其他检测方式")
+                continue
+            packages = set()
+            for line in out.splitlines():
+                if any(marker in line for marker in markers):
+                    component = re.search(r"\b([\w.]+)/[\w.$]+", line)
+                    if component:
+                        packages.add(component.group(1))
+            # 识别出其他应用的前台记录也属于明确结果，无需继续查询。
+            # 历史任务、空输出或 null 焦点都不能作为前台状态的依据。
+            if packages:
+                in_foreground = GAME_PKG in packages
                 break
-        if found:
+        if in_foreground is not None:
             break
-        # 方法2: mCurrentFocus
-        out2 = adb_shell("dumpsys window")
-        found2 = False
-        for line in out2.splitlines():
-            stripped = line.strip()
-            if ("mCurrentFocus" in stripped or "mFocusedApp" in stripped) and GAME_PKG in stripped:
-                found2 = True
-                break
-        if found2:
-            break
-        # 方法3: top activity
-        out3 = adb_shell("dumpsys activity top")
-        found3 = False
-        for line in out3.splitlines():
-            stripped = line.strip()
-            if "ACTIVITY" in stripped and GAME_PKG in stripped:
-                found3 = True
-                break
-        if found3:
-            break
-        # dumpsys 有正常输出且三种方式均未命中，说明游戏确实不在前台。
-        if out.strip() or out2.strip() or out3.strip():
-            break
-        print(f"  ⚠️ 检测失败，重试 {attempt+1}/3...")
-        time.sleep(2)
-    
-    in_foreground = found or found2 or found3
-    if in_foreground:
-        print("  🎮 王者荣耀在前台，退出...")
+        if attempt < 2:
+            print(f"  ⚠️ 未读到前台记录，重试 {attempt+1}/3...")
+            time.sleep(2)
+
+    if in_foreground is None and last_timeout is not None:
+        # 两种查询均无法确认状态时才交给主流程进行连接恢复。
+        raise last_timeout
+    if in_foreground is not False:
+        if in_foreground:
+            print("  🎮 王者荣耀在前台，退出...")
+        else:
+            print("  ⚠️ 无法确认前台状态，退出游戏后重新启动...")
         adb_shell(f"am force-stop {GAME_PKG}")
         print("  ⏳ 等待2秒...")
         time.sleep(2)
         return True
     else:
-        print(f"  ✅ 王者荣耀不在前台")
+        print("  ✅ 王者荣耀不在前台")
         return False
 
 # ============================================================
@@ -2260,7 +2256,12 @@ def adb_host_command(*args, timeout=15):
 def _device_state_ok():
     try:
         result = adb_command("get-state")
-        return result.returncode == 0 and result.stdout.strip() == "device"
+        if result.returncode != 0 or result.stdout.strip() != "device":
+            return False
+        # get-state 只反映 ADB 服务端缓存的连接状态，半死的无线连接也可能
+        # 返回 device；再执行轻量 shell 命令，确认手机确实能响应。
+        probe = adb_command("shell", "echo wzry_adb_probe", timeout=5)
+        return probe.returncode == 0 and probe.stdout.strip() == "wzry_adb_probe"
     except (OSError, subprocess.TimeoutExpired):
         return False
 

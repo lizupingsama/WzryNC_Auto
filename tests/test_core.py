@@ -262,6 +262,80 @@ class AdbTests(unittest.TestCase):
         self.assertNotIn("shell", kwargs)
 
 
+class ForegroundStatusTests(unittest.TestCase):
+    @staticmethod
+    def _activity(package):
+        return f"mResumedActivity: ActivityRecord{{123 u0 {package}/.MainActivity t1}}\n"
+
+    @patch("wzry_auto.adb_shell")
+    def test_launcher_foreground_skips_other_queries_and_cached_game(self, shell):
+        shell.return_value = (
+            f"Hist #0: ActivityRecord{{123 u0 {wzry_auto.GAME_PKG}/.SGameActivity}}\n"
+            + self._activity("com.miui.home")
+        )
+        self.assertFalse(wzry_auto.step1_check_status())
+        shell.assert_called_once_with("dumpsys activity activities")
+
+    @patch("wzry_auto.time.sleep")
+    @patch("wzry_auto.adb_shell")
+    def test_game_foreground_is_stopped_before_launch(self, shell, _sleep):
+        shell.side_effect = [self._activity(wzry_auto.GAME_PKG), ""]
+        self.assertTrue(wzry_auto.step1_check_status())
+        self.assertEqual(shell.call_count, 2)
+        self.assertEqual(
+            shell.call_args.args, (f"am force-stop {wzry_auto.GAME_PKG}",)
+        )
+
+    @patch("wzry_auto.time.sleep")
+    @patch("wzry_auto.adb_shell")
+    def test_activity_query_timeout_falls_back_to_window_focus(self, shell, _sleep):
+        shell.side_effect = [
+            subprocess.TimeoutExpired("dumpsys activity activities", 10),
+            f"mCurrentFocus=Window{{123 u0 {wzry_auto.GAME_PKG}/.SGameActivity}}\n",
+            "",
+        ]
+        self.assertTrue(wzry_auto.step1_check_status())
+        self.assertEqual(shell.call_args_list[1].args, ("dumpsys window",))
+
+    @patch("wzry_auto.adb_shell")
+    def test_dump_without_front_record_falls_back_to_window(self, shell):
+        shell.side_effect = [
+            f"Hist #0: ActivityRecord{{123 u0 {wzry_auto.GAME_PKG}/.SGameActivity}}\n",
+            "mCurrentFocus=Window{123 u0 com.miui.home/.Launcher}\n",
+        ]
+        self.assertFalse(wzry_auto.step1_check_status())
+        self.assertEqual(shell.call_count, 2)
+
+    @patch("wzry_auto.adb_shell")
+    def test_similar_package_name_is_not_the_game(self, shell):
+        shell.return_value = self._activity(wzry_auto.GAME_PKG + ".other")
+        self.assertFalse(wzry_auto.step1_check_status())
+        shell.assert_called_once()
+
+    @patch("wzry_auto.time.sleep")
+    @patch("wzry_auto.adb_shell")
+    def test_all_queries_timeout_propagates_for_connection_recovery(self, shell, sleep):
+        error = subprocess.TimeoutExpired("dumpsys window", 10)
+        shell.side_effect = error
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            wzry_auto.step1_check_status()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(shell.call_count, 6)
+        self.assertEqual(sleep.call_count, 2)
+
+    @patch("wzry_auto.time.sleep")
+    @patch("wzry_auto.adb_shell")
+    def test_unknown_foreground_resets_game_instead_of_claiming_background(self, shell, _sleep):
+        shell.side_effect = ["", "mCurrentFocus=null\n"] * 3 + [""]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertTrue(wzry_auto.step1_check_status())
+        self.assertNotIn("王者荣耀不在前台", output.getvalue())
+        self.assertEqual(
+            shell.call_args.args, (f"am force-stop {wzry_auto.GAME_PKG}",)
+        )
+
+
 class WirelessReconnectTests(unittest.TestCase):
     @staticmethod
     def _completed(returncode=0, stdout=""):
@@ -275,6 +349,7 @@ class WirelessReconnectTests(unittest.TestCase):
             self._completed(0),                                       # disconnect
             self._completed(0, "connected to 192.168.1.10:5555\n"),   # connect
             self._completed(0, "device\n"),                           # get-state 确认
+            self._completed(0, "wzry_adb_probe\n"),                   # shell 确认响应
         ]
         previous = wzry_auto.DEVICE
         try:
@@ -284,9 +359,47 @@ class WirelessReconnectTests(unittest.TestCase):
             )
         finally:
             wzry_auto.DEVICE = previous
-        self.assertEqual(run.call_count, 4)
+        self.assertEqual(run.call_count, 5)
         connect_args = run.call_args_list[2][0][0]
         self.assertEqual(connect_args[-2:], ["connect", "192.168.1.10:5555"])
+
+    @patch("wzry_auto.subprocess.run")
+    def test_healthy_device_checks_shell_without_reconnecting(self, run):
+        run.side_effect = [
+            self._completed(0, "device\n"),
+            self._completed(0, "wzry_adb_probe\n"),
+        ]
+        with patch.object(wzry_auto, "DEVICE", "192.168.1.10:5555"):
+            self.assertTrue(wzry_auto.ensure_device_connected(max_attempts=1))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args.args[0][-2:], ["shell", "echo wzry_adb_probe"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+    @patch("wzry_auto.time.sleep")
+    @patch("wzry_auto.subprocess.run")
+    def test_stale_device_state_with_shell_timeout_reconnects(self, run, _sleep):
+        run.side_effect = [
+            self._completed(0, "device\n"),                            # 半死连接仍在线
+            subprocess.TimeoutExpired("shell echo", 5),             # 手机无法响应
+            self._completed(0),                                      # disconnect
+            self._completed(0, "connected to 192.168.1.10:5555\n"),  # connect
+            self._completed(0, "device\n"),
+            self._completed(0, "wzry_adb_probe\n"),
+        ]
+        with patch.object(wzry_auto, "DEVICE", "192.168.1.10:5555"):
+            self.assertTrue(wzry_auto.ensure_device_connected(max_attempts=1))
+        self.assertEqual(run.call_count, 6)
+        self.assertEqual(
+            run.call_args_list[2].args[0][-2:],
+            ["disconnect", "192.168.1.10:5555"],
+        )
+
+    @patch("wzry_auto.subprocess.run")
+    def test_device_state_rejects_failed_or_empty_shell_response(self, run):
+        for response in (self._completed(1, "wzry_adb_probe\n"), self._completed(0, "")):
+            with self.subTest(returncode=response.returncode, stdout=response.stdout):
+                run.side_effect = [self._completed(0, "device\n"), response]
+                self.assertFalse(wzry_auto._device_state_ok())
 
     @patch("wzry_auto.time.sleep")
     @patch("wzry_auto.subprocess.run")
