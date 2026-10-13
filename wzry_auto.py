@@ -2370,7 +2370,7 @@ def start_stats_server():
         import stats_server
         port = int(os.environ.get("WZRY_STATS_PORT", "8765"))
         stats_server.start_in_background(STATS_FILE, port)
-        print(f"  📊 统计面板: http://localhost:{port}")
+        print(f"  📊 统计面板: http://127.0.0.1:{port}")
     except Exception as exc:
         print(f"  ⚠️ 统计面板启动失败（不影响挂机）: {exc}")
 

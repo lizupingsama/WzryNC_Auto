@@ -1583,9 +1583,10 @@ class FarmGui:
     def open_stats_page(self):
         """打开统计面板：服务在线走实时模式，否则打开离线快照页。"""
         if self._stats_server_alive():
-            webbrowser.open(f"http://localhost:{STATS_PORT}")
+            # 服务绑定 IPv4；localhost 可能解析到 ::1 并连到其他进程。
+            webbrowser.open(f"http://127.0.0.1:{STATS_PORT}")
             self._append_log(
-                f"[助手] 已打开统计面板（实时模式 http://localhost:{STATS_PORT}）；"
+                f"[助手] 已打开统计面板（实时模式 http://127.0.0.1:{STATS_PORT}）；"
                 "浏览器可能在后台打开，未弹出请查看浏览器窗口\n"
             )
             return
