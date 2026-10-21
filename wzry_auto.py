@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 王者荣耀农场自动化务农 v3
-完全基于模板匹配 + 摇杆操作
+基于模板匹配、文字识别和摇杆操作
 新增：浇水时间计算、统计功能、多分辨率支持、唤醒解锁、亮度控制
 """
 
@@ -175,7 +175,6 @@ def apply_step6_env_overrides(cfg):
 
 # 模板搜索区域使用归一化坐标 (x1, y1, x2, y2)，减少动态背景误匹配。
 TEMPLATE_ROIS = {
-    "start_game.png": (0.25, 0.55, 0.75, 1.00),
     # 左界须留到 0.70：版本更新公告类宽弹窗的 ✕ 中心在 0.78 屏宽处，
     # 模板主体会伸到 0.78 左侧，框到 0.78 会把它裁掉导致匹配不到。
     "close_popup.png": (0.70, 0.03, 0.96, 0.30),
@@ -191,14 +190,12 @@ TEMPLATE_ROIS = {
     "agree_terms.png": (0.48, 0.62, 0.82, 0.92),
     # 新版 UI 通用左上角返回箭头（活动页/农场页同款同位）
     "back_arrow.png": (0.04, 0.00, 0.19, 0.12),
-    "lainongchang.png": (0.00, 0.55, 0.55, 1.00),
     "refresh_pos.png": (0.75, 0.70, 1.00, 1.00),
     "oneclick_farm.png": (0.45, 0.35, 0.80, 0.80),
     "harvest_continue.png": (0.30, 0.70, 0.70, 1.00),
 }
 
 TEMPLATE_THRESHOLDS = {
-    "start_game.png": 0.75,
     "close_popup.png": 0.90,
     "close_popup_event.png": 0.78,
     # 两张失败现场正样本均 1.000，全部参考截图噪声上限 0.544；
@@ -210,7 +207,6 @@ TEMPLATE_THRESHOLDS = {
     "agree_terms.png": 0.85,
     # 白色箭头字形主导得分，换背景实测仍有 0.917（农场页），噪声上限 0.573
     "back_arrow.png": 0.80,
-    "lainongchang.png": 0.75,
     "refresh_pos.png": 0.60,
     "oneclick_farm.png": 0.75,
     "harvest_continue.png": 0.85,
@@ -225,6 +221,20 @@ LOBBY_POPUP_CLOSERS = [
     "close_popup_kpl_final.png",
     "dialog_confirm.png",
 ]
+
+# 文字入口随活动换皮频繁，按完整文字定位，不依赖按钮图片。
+# 区域须覆盖新旧入口位置，同时排除底部聊天栏和右侧活动宣传。
+TEXT_BUTTONS = {
+    "start_game": {
+        "texts": ("开始游戏",),
+        "roi": (0.25, 0.58, 0.75, 0.87),
+    },
+    "enter_farm": {
+        "texts": ("王者农场", "来农场", "来农场干农活"),
+        "roi": (0.15, 0.58, 0.52, 0.85),
+    },
+}
+TEXT_BUTTON_MIN_CONFIDENCE = 0.85
 
 # ============================================================
 # 统计数据
@@ -1103,14 +1113,18 @@ def find_any_template(template_names, screenshot_path, thresholds=None):
             best = result
     return best
 
-def wait_for_any_template(template_names, timeout=60, interval=1, label="页面"):
-    """轮询等待任一目标出现；成功后返回匹配结果。"""
+def wait_for_page(template_names=(), timeout=60, interval=1, label="页面",
+                  text_button=None):
+    """轮询等待模板或文字入口出现；成功后返回定位结果。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         screenshot(SCREENSHOT_PATH)
         result = find_any_template(template_names, SCREENSHOT_PATH)
+        if result is None and text_button:
+            result = find_text_button(text_button, SCREENSHOT_PATH)
         if result:
-            print(f"  ✅ {label}已就绪: {result['template']}")
+            target = result.get("text") or result["template"]
+            print(f"  ✅ {label}已就绪: {target}")
             return result
         remaining = max(0, int(deadline - time.monotonic()))
         print(f"  ⏳ 等待{label}，剩余 {remaining}秒")
@@ -1224,7 +1238,7 @@ def reset_position():
     return False
 
 # ============================================================
-# OCR 成熟时间
+# OCR 按钮定位与成熟时间
 # ============================================================
 _ocr_engine = None
 
@@ -1234,6 +1248,54 @@ def get_ocr():
         from rapidocr_onnxruntime import RapidOCR
         _ocr_engine = RapidOCR()
     return _ocr_engine
+
+
+def find_text_button(button_name, screenshot_path):
+    """在按钮区域内识别完整文字，返回截图中的文字中心坐标。"""
+    config = TEXT_BUTTONS[button_name]
+    img = cv_imread(screenshot_path)
+    if img is None:
+        return None
+
+    height, width = img.shape[:2]
+    left, top, right, bottom = config["roi"]
+    x1, y1 = int(left * width), int(top * height)
+    x2, y2 = int(right * width), int(bottom * height)
+    try:
+        rows, _ = get_ocr()(img[y1:y2, x1:x2])
+    except Exception as exc:
+        print(f"  ⚠️ 按钮文字识别失败 [{button_name}]: {exc}")
+        return None
+
+    best = None
+    for box, text, score in rows or []:
+        # 去掉空白、标点和英文副标题，仍要求完整中文匹配，避免命中活动说明。
+        chinese = re.sub(r"[^\u4e00-\u9fff]", "", text)
+        if chinese not in config["texts"] or score < TEXT_BUTTON_MIN_CONFIDENCE:
+            continue
+        if best is None or score > best["score"]:
+            best = {
+                "x": x1 + round(sum(point[0] for point in box) / len(box)),
+                "y": y1 + round(sum(point[1] for point in box) / len(box)),
+                "score": float(score), "text": text,
+            }
+
+    if best:
+        print(f"  ✅ OCR '{best['text']}': score={best['score']:.3f} "
+              f"@ ({best['x']},{best['y']})")
+    else:
+        seen = " / ".join(row[1] for row in rows or []) or "无文字"
+        print(f"  ❌ OCR [{button_name}]: 未识别到入口（{seen}）")
+    return best
+
+
+def click_text_button(button_name, screenshot_path, label=""):
+    """按文字的实际位置点击按钮；未识别或置信度不足时不点击。"""
+    result = find_text_button(button_name, screenshot_path)
+    if result is None:
+        return False
+    tap(result["x"], result["y"], label or result["text"])
+    return True
 
 def parse_relative_maturity(text):
     """解析"X小时Y分钟后成熟"类相对时间，返回剩余分钟数；不匹配返回 None。"""
@@ -1463,10 +1525,9 @@ def step2_launch_game():
     print("\n[步骤2] 启动游戏...")
     adb_shell(f"am start -n {GAME_ACT}")
     print("  ⏳ 等待登录页或启动弹窗...")
-    return wait_for_any_template(
-        ["start_game.png", "close_popup.png", "close_popup_event.png",
-         "agree_terms.png"],
-        timeout=60, interval=1, label="游戏启动页",
+    return wait_for_page(
+        ["close_popup.png", "close_popup_event.png", "agree_terms.png"],
+        timeout=60, interval=1, label="游戏启动页", text_button="start_game",
     ) is not None
 
 
@@ -1493,7 +1554,7 @@ def step2b_close_startup_popups():
             print("  ⏳ 等待2秒...")
             time.sleep(2)
         else:
-            if find_template("start_game.png", SCREENSHOT_PATH):
+            if find_text_button("start_game", SCREENSHOT_PATH):
                 print("  ✅ 已到登录页，无需继续处理启动弹窗")
                 break
             miss_count += 1
@@ -1518,15 +1579,21 @@ def step3_click_start_game():
         print(f"  尝试 {attempt+1}/5...")
         screenshot(SCREENSHOT_PATH)
         
-        if click_template("start_game.png", SCREENSHOT_PATH, label="开始游戏"):
+        # 先处理协议遮挡，再识别登录按钮，避免点击弹窗背后的文字。
+        if click_template("agree_terms.png", SCREENSHOT_PATH, label="同意协议"):
+            print("  ⏳ 已同意协议，等待2秒...")
+            time.sleep(2)
+            continue
+
+        if click_text_button("start_game", SCREENSHOT_PATH, label="开始游戏"):
             print("  ⏳ 等待大厅...")
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
                 screenshot(SCREENSHOT_PATH)
                 if find_any_template(
-                    LOBBY_POPUP_CLOSERS + ["lainongchang.png"],
+                    LOBBY_POPUP_CLOSERS,
                     SCREENSHOT_PATH,
-                ):
+                ) or find_text_button("enter_farm", SCREENSHOT_PATH):
                     print("  ✅ 大厅已就绪")
                     return True
                 # 登录后可能盖全屏活动页（如回归福利，无 ✕ 只有返回），点返回退出
@@ -1538,12 +1605,6 @@ def step3_click_start_game():
                 time.sleep(1)
             save_diagnostic("step3_lobby_timeout")
             return False
-
-        # 协议条款更新后首启弹「拒绝/同意」确认框（无 ✕），点掉后登录页才出现
-        if click_template("agree_terms.png", SCREENSHOT_PATH, label="同意协议"):
-            print("  ⏳ 已同意协议，等待2秒...")
-            time.sleep(2)
-            continue
 
         if attempt < 4:
             print("  ⏳ 等待2秒...")
@@ -1572,7 +1633,7 @@ def step4_close_popup():
             print("  ⏳ 等待2秒...")
             time.sleep(2)
         else:
-            if find_template("lainongchang.png", SCREENSHOT_PATH):
+            if find_text_button("enter_farm", SCREENSHOT_PATH):
                 print("  ✅ 已进入大厅主页，弹窗处理完毕")
                 break
             miss_count += 1
@@ -1595,21 +1656,21 @@ def step5_enter_farm():
     for attempt in range(10):  # 最多尝试10次
         screenshot(SCREENSHOT_PATH)
 
-        if click_template("lainongchang.png", SCREENSHOT_PATH, label="进入农场"):
-            print("  ⏳ 等待农场加载...")
-            if wait_for_any_template(
-                ["refresh_pos.png"], timeout=60, interval=1, label="农场"
-            ):
-                return True
-            save_diagnostic("step5_farm_timeout")
-            return False
-
-        # 弹窗可能晚于步骤4才出现（KPL 观赛、休息提醒等）挡住入口，先关掉再找
+        # 弹窗可能晚于步骤4出现；先处理遮挡，避免 OCR 点击背景里的农场文字。
         popup = find_any_template(LOBBY_POPUP_CLOSERS, SCREENSHOT_PATH)
         if popup:
             tap(popup["x"], popup["y"], f"关闭弹窗/{popup['template']}")
             time.sleep(2)
             continue
+
+        if click_text_button("enter_farm", SCREENSHOT_PATH, label="进入农场"):
+            print("  ⏳ 等待农场加载...")
+            if wait_for_page(
+                ["refresh_pos.png"], timeout=60, interval=1, label="农场"
+            ):
+                return True
+            save_diagnostic("step5_farm_timeout")
+            return False
 
         print(f"  ⏳ 等待2秒... ({attempt+1}/10)")
         time.sleep(2)

@@ -19,41 +19,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TemplateMatchingTests(unittest.TestCase):
-    def test_start_game_matches_anniversary_login(self):
-        # 2026-10-21 金色周年按钮改为深色字，旧白字模板只能得到约 0.56。
-        result = wzry_auto.find_template(
-            "start_game.png",
-            str(ROOT / "assets" / "screenshots" / "3200x1440_anniversary_login.png"),
-        )
-        self.assertIsNotNone(result)
-        self.assertEqual((result["x"], result["y"]), (1600, 1125))
-
-    def test_start_game_preserves_previous_login_styles(self):
-        # 3200 模板更新后，原白字按钮仍须由 2400 模板按屏高缩放兜底。
-        for name, center in (
-            ("3200x1440_login.png", (1586, 1123)),
-            ("wutanchuangzhuye.png", (633, 561)),
-        ):
-            with self.subTest(screenshot=name):
-                result = wzry_auto.find_template(
-                    "start_game.png", str(ROOT / "assets" / "screenshots" / name)
-                )
-                self.assertIsNotNone(result)
-                self.assertEqual((result["x"], result["y"]), center)
-
-    def test_start_game_absent_on_non_login_screens(self):
-        login_screens = {
-            "3200x1440_anniversary_login.png", "3200x1440_login.png",
-            "wutanchuangzhuye.png", "kaishiyouxi.png",
-        }
-        for screenshot in sorted((ROOT / "assets" / "screenshots").glob("*.png")):
-            if screenshot.name in login_screens:
-                continue
-            with self.subTest(screenshot=screenshot.name):
-                self.assertIsNone(
-                    wzry_auto.find_template("start_game.png", str(screenshot))
-                )
-
     def test_event_popup_close_matches_in_safe_region(self):
         template = wzry_auto.cv_imread(
             ROOT / "assets" / "templates" / "2400x1080"
@@ -163,7 +128,6 @@ class TemplateMatchingTests(unittest.TestCase):
         # 按「UI 随屏高等比缩放、宽度只是两侧留边」模拟现役另两档分辨率，
         # 实测 KPL✕ 0.987/0.994、确定钮 0.987/0.975，均远超阈值
         cases = [
-            ("start_game.png", "3200x1440_anniversary_login.png", (1600, 1125)),
             ("close_popup_kpl.png", "3200x1440_kpl_live_popup.png", (2807, 157)),
             ("close_popup_kpl_final.png", "3200x1440_kpl_final_popup.png", (2807, 159)),
             ("dialog_confirm.png", "3200x1440_rest_reminder_popup.png", (1595, 928)),
