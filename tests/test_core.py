@@ -98,6 +98,46 @@ class TemplateMatchingTests(unittest.TestCase):
                 )
                 self.assertIsNone(result)
 
+    def test_kpl_round_popup_close_matches_at_real_position(self):
+        # 2026-10-27 失败现场：圆形关闭钮未被旧模板识别，步骤3误判大厅未就绪。
+        result = wzry_auto.find_any_template(
+            wzry_auto.LOBBY_POPUP_CLOSERS,
+            str(ROOT / "assets" / "screenshots" / "3200x1440_kpl_round_popup.png"),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["template"], "close_popup_kpl_round.png")
+        self.assertEqual((result["x"], result["y"]), (2807, 158))
+
+    def test_kpl_round_popup_close_absent_on_other_reference_screens(self):
+        for screenshot in sorted((ROOT / "assets" / "screenshots").glob("*.png")):
+            if screenshot.name == "3200x1440_kpl_round_popup.png":
+                continue
+            with self.subTest(screenshot=screenshot.name):
+                result = wzry_auto.find_template(
+                    "close_popup_kpl_round.png", str(screenshot)
+                )
+                self.assertIsNone(result)
+
+    def test_round_popup_allows_lobby_detection_and_is_closed(self):
+        popup = str(ROOT / "assets" / "screenshots" / "3200x1440_kpl_round_popup.png")
+        lobby = str(ROOT / "assets" / "screenshots" / "3200x1440_anniversary_lobby.png")
+        frames = iter((popup, popup, popup, lobby))
+
+        def next_frame(path):
+            wzry_auto.SCREENSHOT_PATH = next(frames)
+
+        with patch.object(wzry_auto, "SCREENSHOT_PATH", popup), \
+             patch.object(wzry_auto, "screenshot", side_effect=next_frame), \
+             patch.object(wzry_auto, "click_text_button", return_value=True), \
+             patch.object(wzry_auto, "find_text_button", return_value={"text": "王者农场"}) as farm, \
+             patch.object(wzry_auto, "tap") as tap, \
+             patch.object(wzry_auto.time, "sleep"):
+            self.assertTrue(wzry_auto.step3_click_start_game())
+            farm.assert_not_called()
+            self.assertTrue(wzry_auto.step4_close_popup())
+        tap.assert_called_once_with(2807, 158, "关闭弹窗/close_popup_kpl_round.png")
+        farm.assert_called_once_with("enter_farm", lobby)
+
     def test_dialog_confirm_matches_on_rest_reminder(self):
         # 健康系统「呵护双眼」休息提醒只有 确定/帮助/前往营地 三键、无 ✕；
         # 模板取自 3200x1440 失败现场，「确定」中心位于 (1595,928)
@@ -130,6 +170,7 @@ class TemplateMatchingTests(unittest.TestCase):
         cases = [
             ("close_popup_kpl.png", "3200x1440_kpl_live_popup.png", (2807, 157)),
             ("close_popup_kpl_final.png", "3200x1440_kpl_final_popup.png", (2807, 159)),
+            ("close_popup_kpl_round.png", "3200x1440_kpl_round_popup.png", (2807, 158)),
             ("dialog_confirm.png", "3200x1440_rest_reminder_popup.png", (1595, 928)),
         ]
         for width, height in ((2510, 1156), (2400, 1080)):
@@ -162,6 +203,7 @@ class TemplateMatchingTests(unittest.TestCase):
         # 步骤3/4/5 共用的弹窗关闭清单必须覆盖各款赛事弹窗和休息提醒。
         self.assertIn("close_popup_kpl.png", wzry_auto.LOBBY_POPUP_CLOSERS)
         self.assertIn("close_popup_kpl_final.png", wzry_auto.LOBBY_POPUP_CLOSERS)
+        self.assertIn("close_popup_kpl_round.png", wzry_auto.LOBBY_POPUP_CLOSERS)
         self.assertIn("dialog_confirm.png", wzry_auto.LOBBY_POPUP_CLOSERS)
 
     def test_agree_terms_matches_at_real_position(self):
