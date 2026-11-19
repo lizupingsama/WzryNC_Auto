@@ -554,15 +554,14 @@ class WirelessGuiHelperTests(unittest.TestCase):
         gui.device_entry = Mock()
         gui.device_entry.get.return_value = "10.0.0.8:5555"
         gui.cmd_queue = Mock()
-        gui._append_log = Mock()
 
         actions = []
         responses = {
-            ("disconnect", "10.0.0.8:5555"): self._completed(
-                0, "disconnected 10.0.0.8:5555"
-            ),
             ("devices",): self._completed(
                 0, "List of devices attached\nUSB1234\tdevice\n"
+            ),
+            ("disconnect", "10.0.0.8:5555"): self._completed(
+                0, "disconnected 10.0.0.8:5555"
             ),
             ("-s", "USB1234", "shell", "ip", "route"): self._completed(
                 0, "192.168.1.0/24 dev wlan0 scope link src 192.168.1.100\n"
@@ -584,12 +583,11 @@ class WirelessGuiHelperTests(unittest.TestCase):
 
         gui._adb_run = adb_run
         gui._start_adb_task = lambda _name, worker: worker()
-        gui._set_device_entry = lambda addr: actions.append(("entry", addr))
 
         with patch.object(self.gui_module.time, "sleep"):
             self.FarmGui.usb_to_wireless(gui)
 
-        self.assertEqual(actions[0], ("entry", ""))
+        self.assertEqual(actions[0], ("devices",))
         self.assertEqual(actions[1], ("disconnect", "10.0.0.8:5555"))
         self.assertIn(("connect", "192.168.1.100:5555"), actions)
         self.assertNotIn(("connect", "10.0.0.8:5555"), actions)
@@ -597,8 +595,37 @@ class WirelessGuiHelperTests(unittest.TestCase):
             actions[-1], ("-s", "192.168.1.100:5555", "get-state")
         )
         gui.cmd_queue.put.assert_any_call(
+            ("wireless_clear", "10.0.0.8:5555")
+        )
+        gui.cmd_queue.put.assert_any_call(
             ("wireless_ok", "192.168.1.100:5555")
         )
+
+    def test_usb_to_wireless_keeps_old_addr_when_usb_missing(self):
+        gui = object.__new__(self.FarmGui)
+        gui.device_entry = Mock()
+        gui.device_entry.get.return_value = "10.0.0.8:5555"
+        gui.cmd_queue = Mock()
+
+        actions = []
+
+        def adb_run(*args, **_kwargs):
+            actions.append(args)
+            return self._completed(0, "List of devices attached\n")
+
+        gui._adb_run = adb_run
+        gui._start_adb_task = lambda _name, worker: worker()
+
+        self.FarmGui.usb_to_wireless(gui)
+
+        self.assertEqual(actions, [("devices",)])
+        gui.cmd_queue.put.assert_called_once_with(
+            (
+                "log",
+                "[无线ADB] ❌ 未检测到USB设备，请先用数据线连接手机并允许USB调试\n",
+            )
+        )
+        self.assertEqual(gui.device_entry.get.call_count, 1)
 
     @staticmethod
     def _completed(returncode=0, stdout="", stderr=""):

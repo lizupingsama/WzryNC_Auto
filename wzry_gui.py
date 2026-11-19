@@ -884,30 +884,12 @@ class FarmGui:
     def usb_to_wireless(self):
         """USB 连接的手机一键切换为无线。
 
-        先清空旧的无线地址/连接，再只用 USB 序列号让手机进入 TCP 模式，
-        最后连接刚从 USB 读到的 WiFi 地址，绝不拿输入框里的旧地址去连接。
+        确认恰好连接一台 USB 设备后，才清空旧无线地址/连接；随后只用 USB
+        序列号让手机进入 TCP 模式，最后连接刚从 USB 读到的 WiFi 地址。
         """
         previous_addr = self._normalize_wireless_addr(self.device_entry.get())
-        self._set_device_entry("")
-        if previous_addr:
-            self._append_log(f"[无线ADB] 已清空旧无线地址 {previous_addr}\n")
 
         def worker():
-            if previous_addr:
-                disconnected = self._adb_run("disconnect", previous_addr)
-                disconnected_out = (
-                    disconnected.stdout + disconnected.stderr
-                ).strip()
-                if disconnected.returncode == 0 or "disconnected" in disconnected_out:
-                    self.cmd_queue.put(
-                        ("log", f"[无线ADB] 已断开旧无线连接 {previous_addr}\n")
-                    )
-                else:
-                    self.cmd_queue.put(
-                        ("log", f"[无线ADB] ⚠️ 旧无线连接清理失败，继续切换: "
-                                f"{disconnected_out or '无输出'}\n")
-                    )
-
             devices = self._adb_run("devices")
             usb = []
             for line in devices.stdout.splitlines()[1:]:
@@ -925,6 +907,27 @@ class FarmGui:
                 )
                 return
             serial = usb[0]
+
+            if previous_addr:
+                # UI 只能在主线程修改；队列顺序保证先清空地址，再断开旧连接。
+                self.cmd_queue.put(("wireless_clear", previous_addr))
+                self.cmd_queue.put(
+                    ("log", f"[无线ADB] 已检测到USB，清空旧无线地址 {previous_addr}\n")
+                )
+                disconnected = self._adb_run("disconnect", previous_addr)
+                disconnected_out = (
+                    disconnected.stdout + disconnected.stderr
+                ).strip()
+                if disconnected.returncode == 0 or "disconnected" in disconnected_out:
+                    self.cmd_queue.put(
+                        ("log", f"[无线ADB] 已断开旧无线连接 {previous_addr}\n")
+                    )
+                else:
+                    self.cmd_queue.put(
+                        ("log", f"[无线ADB] ⚠️ 旧无线连接清理失败，继续切换: "
+                                f"{disconnected_out or '无输出'}\n")
+                    )
+
             route = self._adb_run("-s", serial, "shell", "ip", "route")
             ip = self._parse_wlan_ip(route.stdout)
             if not ip:
@@ -1409,6 +1412,12 @@ class FarmGui:
                     self._refresh_adb_controls()
                 elif kind == "wireless_ok":
                     self._set_device_entry(payload)
+                elif kind == "wireless_clear":
+                    current = self._normalize_wireless_addr(
+                        self._entry_text("device_entry", "wireless_device")
+                    )
+                    if current == payload:
+                        self._set_device_entry("")
                 elif kind == "device_status":
                     text, level = payload
                     self.device_status_var.set(text)
