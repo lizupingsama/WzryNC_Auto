@@ -882,8 +882,32 @@ class FarmGui:
         self._start_adb_task("连接", worker)
 
     def usb_to_wireless(self):
-        """USB 连接的手机一键切换为无线：tcpip 5555 → 取 WiFi 地址 → connect。"""
+        """USB 连接的手机一键切换为无线。
+
+        先清空旧的无线地址/连接，再只用 USB 序列号让手机进入 TCP 模式，
+        最后连接刚从 USB 读到的 WiFi 地址，绝不拿输入框里的旧地址去连接。
+        """
+        previous_addr = self._normalize_wireless_addr(self.device_entry.get())
+        self._set_device_entry("")
+        if previous_addr:
+            self._append_log(f"[无线ADB] 已清空旧无线地址 {previous_addr}\n")
+
         def worker():
+            if previous_addr:
+                disconnected = self._adb_run("disconnect", previous_addr)
+                disconnected_out = (
+                    disconnected.stdout + disconnected.stderr
+                ).strip()
+                if disconnected.returncode == 0 or "disconnected" in disconnected_out:
+                    self.cmd_queue.put(
+                        ("log", f"[无线ADB] 已断开旧无线连接 {previous_addr}\n")
+                    )
+                else:
+                    self.cmd_queue.put(
+                        ("log", f"[无线ADB] ⚠️ 旧无线连接清理失败，继续切换: "
+                                f"{disconnected_out or '无输出'}\n")
+                    )
+
             devices = self._adb_run("devices")
             usb = []
             for line in devices.stdout.splitlines()[1:]:
@@ -914,7 +938,9 @@ class FarmGui:
                     ("log", "[无线ADB] ❌ 未能获取手机 WiFi 地址，请确认手机已连接 WiFi\n")
                 )
                 return
-            self.cmd_queue.put(("log", f"[无线ADB] 手机地址 {ip}，正在切换TCP模式...\n"))
+            self.cmd_queue.put(
+                ("log", f"[无线ADB] 已通过USB读取手机地址 {ip}，正在写入TCP模式...\n")
+            )
             tcpip = self._adb_run("-s", serial, "tcpip", "5555")
             if "restarting" not in (tcpip.stdout + tcpip.stderr):
                 out = (tcpip.stdout + tcpip.stderr).strip()
@@ -924,14 +950,21 @@ class FarmGui:
             addr = f"{ip}:5555"
             result = self._adb_run("connect", addr)
             out = (result.stdout + result.stderr).strip()
-            if "connected to" in out:
-                self.cmd_queue.put(
-                    ("log", f"[无线ADB] ✅ 已切换到无线连接 {addr}，"
-                            "现在可以拔掉USB线（手机重启后需重新切换）\n")
-                )
-                self.cmd_queue.put(("wireless_ok", addr))
-            else:
+            if "connected to" not in out:
                 self.cmd_queue.put(("log", f"[无线ADB] ❌ 无线连接失败: {out or '无输出'}\n"))
+                return
+            state = self._adb_run("-s", addr, "get-state")
+            if state.returncode != 0 or state.stdout.strip() != "device":
+                err = (state.stdout + state.stderr).strip()
+                self.cmd_queue.put(
+                    ("log", f"[无线ADB] ❌ 新地址已写入但连接不可用: {err or '无输出'}\n")
+                )
+                return
+            self.cmd_queue.put(
+                ("log", f"[无线ADB] ✅ 已通过USB切换到新无线地址 {addr}，"
+                        "现在可以拔掉USB线（手机重启后需重新切换）\n")
+            )
+            self.cmd_queue.put(("wireless_ok", addr))
         self._start_adb_task("USB转无线", worker)
 
     def open_pair_dialog(self):

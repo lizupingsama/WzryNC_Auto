@@ -9,7 +9,7 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import wzry_auto
@@ -548,6 +548,61 @@ class WirelessGuiHelperTests(unittest.TestCase):
             ("192.168.1.10:5555", "device"),
         )
         self.assertEqual(self.FarmGui._choose_device([], ""), (None, None))
+
+    def test_usb_to_wireless_clears_old_addr_and_connects_new_addr(self):
+        gui = object.__new__(self.FarmGui)
+        gui.device_entry = Mock()
+        gui.device_entry.get.return_value = "10.0.0.8:5555"
+        gui.cmd_queue = Mock()
+        gui._append_log = Mock()
+
+        actions = []
+        responses = {
+            ("disconnect", "10.0.0.8:5555"): self._completed(
+                0, "disconnected 10.0.0.8:5555"
+            ),
+            ("devices",): self._completed(
+                0, "List of devices attached\nUSB1234\tdevice\n"
+            ),
+            ("-s", "USB1234", "shell", "ip", "route"): self._completed(
+                0, "192.168.1.0/24 dev wlan0 scope link src 192.168.1.100\n"
+            ),
+            ("-s", "USB1234", "tcpip", "5555"): self._completed(
+                0, "restarting in TCP mode port: 5555\n"
+            ),
+            ("connect", "192.168.1.100:5555"): self._completed(
+                0, "connected to 192.168.1.100:5555\n"
+            ),
+            ("-s", "192.168.1.100:5555", "get-state"): self._completed(
+                0, "device\n"
+            ),
+        }
+
+        def adb_run(*args, **_kwargs):
+            actions.append(args)
+            return responses[args]
+
+        gui._adb_run = adb_run
+        gui._start_adb_task = lambda _name, worker: worker()
+        gui._set_device_entry = lambda addr: actions.append(("entry", addr))
+
+        with patch.object(self.gui_module.time, "sleep"):
+            self.FarmGui.usb_to_wireless(gui)
+
+        self.assertEqual(actions[0], ("entry", ""))
+        self.assertEqual(actions[1], ("disconnect", "10.0.0.8:5555"))
+        self.assertIn(("connect", "192.168.1.100:5555"), actions)
+        self.assertNotIn(("connect", "10.0.0.8:5555"), actions)
+        self.assertEqual(
+            actions[-1], ("-s", "192.168.1.100:5555", "get-state")
+        )
+        gui.cmd_queue.put.assert_any_call(
+            ("wireless_ok", "192.168.1.100:5555")
+        )
+
+    @staticmethod
+    def _completed(returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
 class HarvestParsingTests(unittest.TestCase):
